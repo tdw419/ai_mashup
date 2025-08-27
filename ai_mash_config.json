@@ -41,10 +41,10 @@
             "temperature": 0.1
         }
     },
-    "export_prompts": {
-        "summary": "You are a summarization agent. Your task is to read the provided text and create a concise, distilled summary. Focus on the key takeaways and main conclusions.",
-        "roadmap": "You are a planning agent. Your task is to analyze the provided text and generate a structured roadmap with milestones, phases, and deliverables. The output must be in JSON format, like: {\"phase\": string, \"goals\": string[], \"tasks\": string[], \"timeline\": string}.",
-        "tasks": "You are a task breakdown agent. Your task is to analyze the provided text and break it down into a list of atomic tasks that could be given to another AI agent. The output must be a YAML-formatted list of tasks, where each task has a 'task', 'agent' (e.g., 'coder', 'writer'), and 'priority' (high/medium/low) field."
+    "exporters": {
+      "summary_prompt": "Summarize the merged multi-AI results in 200–300 words. Focus on decisions, rationale, and immediate implications. Be concise and non-redundant.",
+      "roadmap_prompt": "From the merged multi-AI results, produce a project roadmap as strict JSON with keys: phases (array of {name, goals[], milestones[], risks[], timeline_hint}), and cross_cutting (risks[], assumptions[]).",
+      "tasks_prompt": "From the merged multi-AI results, produce an array of actionable tasks as strict JSON with fields: title, description, owner (role), priority (P0|P1|P2), estimate (hours), dependencies (titles[]). Keep tasks atomic and testable."
     },
     "limits": {
         "max_context_chars": 48000
