@@ -16,7 +16,6 @@ Commands:
                                   -> Use an export as context for a new round
   index                          -> (re)generate mash_runs/index.html viewer
   serve [--port 8888]            -> serve mash_runs/ with a tiny HTTP server
-  issues                          -> generate gh issue create commands from latest reducer output
 
 Requires:
   pip install requests pyperclip
@@ -53,7 +52,7 @@ def load_config() -> Dict[str, Any]:
     except Exception as e:
         raise SystemExit(f"Failed to parse {CONFIG_FILE}: {e}")
 
-CONFIG = {} # Will be loaded after file creation
+CONFIG = load_config()
 
 # --- Utilities ---
 def now_iso() -> str:
@@ -78,10 +77,7 @@ def new_session_dir() -> pathlib.Path:
 def latest_session_dir() -> Optional[pathlib.Path]:
     if not MASH_DIR.exists():
         return None
-    sessions = list(MASH_DIR.glob("session_*"))
-    if not sessions:
-        return None
-    return max(sessions, key=lambda p: p.name)
+    return max(MASH_DIR.glob("session_*"), default=None, key=lambda p: p.name)
 
 def clamp_context(txt: str) -> str:
     """Clamp merged context to configured max length."""
@@ -91,13 +87,6 @@ def clamp_context(txt: str) -> str:
     return txt[:limit] + "\n...[context truncated]..."
 
 # --- Core AI Interaction ---
-
-EXPORT_PROMPTS = {
-    "summary": "You are a summarization agent. Your task is to read the provided text and create a concise, distilled summary. Focus on the key takeaways and main conclusions.",
-    "roadmap": "You are a planning agent. Your task is to analyze the provided text and generate a structured roadmap with milestones, phases, and deliverables. The output must be in JSON format, like: {\"phase\": string, \"goals\": string[], \"tasks\": string[], \"timeline\": string}.",
-    "tasks": "You are a task breakdown agent. Your task is to analyze the provided text and break it down into a list of atomic tasks that could be given to another AI agent. The output must be a YAML-formatted list of tasks, where each task has a 'task', 'agent' (e.g., 'coder', 'writer'), and 'priority' (high/medium/low) field."
-}
-
 def run_export_agent(mode: str, context: str) -> str:
     """Runs the reducer agent with a special system prompt for exporting."""
     reducer_agent = CONFIG.get("reducer")
@@ -106,9 +95,9 @@ def run_export_agent(mode: str, context: str) -> str:
 
     print(f"Running export agent for mode: {mode}...")
 
-    system_prompt = EXPORT_PROMPTS.get(mode)
+    system_prompt = CONFIG.get("export_prompts", {}).get(mode)
     if not system_prompt:
-        raise ValueError(f"Invalid export mode: {mode}")
+        raise ValueError(f"Invalid export mode or prompt not configured: {mode}")
 
     # Create a temporary agent config with the export system prompt
     export_agent_config = reducer_agent.copy()
@@ -231,7 +220,7 @@ def run_round(session_dir: pathlib.Path, round_idx: int, prompt: str, prev_mash:
 
         summary = openai_chat(reducer_agent, reducer_messages)
 
-        # Try to parse structured JSON from the reducer's output
+        # --- Try to parse structured JSON from the reducer's output ---
         structured_summary = None
         json_marker = "\nJSON:"
         if json_marker in summary:
@@ -338,7 +327,6 @@ def cmd_loop(args):
 
     print(f"\nLoop complete → {session_dir / f'round_{args.rounds:02d}' / 'mash_merged.md'}")
 
-
 def get_export_content(mode: str, mash_file_path: pathlib.Path) -> str:
     """Gets the content for a given export mode without writing to a file."""
     if not mash_file_path.exists():
@@ -364,6 +352,7 @@ def cmd_export(args):
 
     latest_round_dir = rounds[-1]
 
+    # Allow specifying a round number
     round_dir = latest_round_dir
     if args.round is not None:
         round_dir = session_dir / f"round_{args.round:02d}"
@@ -383,7 +372,6 @@ def cmd_export(args):
     out_path = export_dir / f"{mode}.{file_extensions[mode]}"
     write_text(out_path, content)
     print(f"'{mode}' export generated: {out_path}")
-
 
 def cmd_resubmit(args):
     """Use an export as context for a new round of prompting."""
@@ -410,68 +398,54 @@ def cmd_resubmit(args):
     run_round(session_dir, next_round_idx, prompt, new_context)
     print(f"\nResubmit successful. New round created → {session_dir / f'round_{next_round_idx:02d}'}")
 
-
 def generate_index_html():
-    """Create a sidebar viewer at mash_runs/index.html showing mash + structured reducer JSON."""
+    """Create a lightweight static viewer at mash_runs/index.html."""
     ensure_dir(MASH_DIR)
     sessions = sorted([p for p in MASH_DIR.glob("session_*") if p.is_dir()], reverse=True)
-
-    # Prepare data for client-side JS
-    data = []
-    for s in sessions:
-        rounds = sorted([p.name for p in s.glob("round_*") if (p / "mash_merged.md").exists()], reverse=True)
-        if rounds:
-            data.append({"name": s.name, "rounds": rounds})
-
-    reducer_name = CONFIG.get("reducer", {}).get("name", "")
-
-    html = '''<!doctype html>
+    html = """<!doctype html>
 <html>
 <head>
 <meta charset="utf-8"/>
 <title>AI Mash Viewer</title>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <style>
-  :root { --border:#ddd; }
-  body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:0;display:flex;height:100vh}
-  .sidebar{width:360px;padding:16px;border-right:1px solid var(--border);overflow-y:auto}
-  .main{flex-grow:1;padding:16px;overflow-y:auto}
-  h1,h2{margin:0 0 8px}
-  label{display:block;margin-top:8px;margin-bottom:4px;font-weight:600}
-  select,button{font-size:14px;padding:6px 8px;width:100%;margin-bottom:8px}
-  #content{white-space:pre-wrap;font-family:Consolas,'Courier New',monospace;line-height:1.5;border:1px solid var(--border);border-radius:6px;padding:12px}
-  details{border:1px solid var(--border);border-radius:6px;padding:8px;margin-top:8px;background:#fafafa}
-  summary{font-weight:700;cursor:pointer}
-  ul{margin:8px 0 0;padding-left:20px}
-  .muted{color:#666}
+body{font-family:system-ui,sans-serif;margin:0;display:flex;height:100vh}
+.sidebar{width:350px;padding:16px;border-right:1px solid #ddd;overflow-y:auto;display:flex;flex-direction:column}
+.main{flex-grow:1;padding:16px;overflow-y:auto}
+h1,h2{margin:0 0 8px}
+label{margin-top:12px;margin-bottom:4px;display:block}
+select,button{font-size:14px;padding:6px 8px;width:100%;margin-bottom:8px}
+#content{white-space:pre-wrap;font-family:Consolas,'Courier New',monospace;line-height:1.5}
+#structured-summary{margin-top:16px}
+details{border:1px solid #ddd;border-radius:4px;padding:8px;margin-bottom:8px}
+summary{font-weight:bold;cursor:pointer}
+ul{margin:8px 0 0;padding-left:20px}
 </style>
 </head>
 <body>
-  <div class="sidebar">
-    <h1>AI Mash Viewer</h1>
-    <label>Session</label>
-    <select id="session"></select>
-    <label>Round</label>
-    <select id="round"></select>
-    <button id="load">Load</button>
-    <div id="structured-summary"></div>
-  </div>
-  <div class="main">
-    <h2>Mash Content</h2>
-    <div id="content" class="muted">Select a session and round, then click Load.</div>
-  </div>
-
+<div class="sidebar">
+  <h1>AI Mash Viewer</h1>
+  <label>Session:</label>
+  <select id="session"></select>
+  <label>Round:</label>
+  <select id="round"></select>
+  <button id="load">Load</button>
+  <div id="structured-summary"></div>
+</div>
+<div class="main">
+  <h2>Mash Content</h2>
+  <div id="content">Select a session/round and click Load.</div>
+</div>
 <script>
 const sessions = %SESSIONS%;
 const REDUCER_NAME = %REDUCER_NAME%;
 const sessionSel = document.getElementById('session');
 const roundSel = document.getElementById('round');
-const contentEl = document.getElementById('content');
-const structuredEl = document.getElementById('structured-summary');
+const content = document.getElementById('content');
 const loadBtn = document.getElementById('load');
+const structuredContainer = document.getElementById('structured-summary');
 
 function populateSessions() {
-  sessionSel.innerHTML = '';
   sessions.forEach(s => {
     const opt = document.createElement('option');
     opt.value = s.name;
@@ -482,7 +456,7 @@ function populateSessions() {
   onSessionChange();
 }
 
-function onSessionChange() {
+function onSessionChange(){
   roundSel.innerHTML = '';
   const s = sessions.find(x => x.name === sessionSel.value);
   (s ? s.rounds : []).forEach(r => {
@@ -496,72 +470,45 @@ function onSessionChange() {
 async function loadMash() {
   const s = sessionSel.value;
   const r = roundSel.value;
-  if (!s || !r) {
-    contentEl.textContent = 'Please select a valid session and round.';
-    return;
-  }
-  structuredEl.innerHTML = '';
-  const url = `${s}/${r}/mash_merged.md`;
-  contentEl.textContent = 'Loading ' + url + ' ...';
+  if (!s || !r) { content.textContent = 'Please select a valid session and round.'; return; }
+  const url = s + '/' + r + '/mash_merged.md';
+  content.textContent = 'Loading ' + url + ' ...';
+  structuredContainer.innerHTML = ''; // Clear previous summary
   try {
     const res = await fetch(url);
-    if (!res.ok) throw new Error(res.status + ' ' + res.statusText);
+    if(!res.ok) throw new Error(res.status + ' ' + res.statusText);
     const txt = await res.text();
-    contentEl.textContent = txt;
-  } catch (e) {
-    contentEl.textContent = 'Failed to load: ' + e;
+    content.textContent = txt;
+    loadStructuredSummary(s, r);
+  } catch(e) {
+    content.textContent = 'Failed to load: ' + e;
   }
-  loadStructuredSummary(s, r);
 }
 
 async function loadStructuredSummary(session, round) {
-  if (!REDUCER_NAME) return;
-  const url = `${session}/${round}/responses/_${REDUCER_NAME}_structured.json`;
-  try {
-    const res = await fetch(url);
-    if (!res.ok) return; // it's fine if the file doesn't exist
-    const data = await res.json();
-    renderStructured(data);
-  } catch(e) {
-    console.warn('Could not load structured summary:', e);
-  }
-}
-
-function titleize(key) {
-  return key.replace(/_/g, ' ').replace(/\\b\\w/g, m => m.toUpperCase());
-}
-
-function renderStructured(data) {
-  let html = '<h2>Consensus Summary</h2>';
-  const sections = ['agreements','disagreements','open_questions','next_actions'];
-
-  let hasAny = false;
-  sections.forEach(key => {
-    if (!data.hasOwnProperty(key)) return;
-    const val = data[key];
-    if (Array.isArray(val) && val.length > 0) {
-      hasAny = true;
-      html += `<details open><summary>${titleize(key)}</summary><ul>`;
-      val.forEach(item => {
-        if (typeof item === 'string') {
-          html += `<li>${escapeHtml(item)}</li>`;
-        } else {
-          html += `<li><pre>${escapeHtml(JSON.stringify(item, null, 2))}</pre></li>`;
+    if (!REDUCER_NAME) return;
+    const url = `${session}/${round}/responses/_${REDUCER_NAME}_structured.json`;
+    try {
+        const res = await fetch(url);
+        if (!res.ok) return; // File might not exist, which is fine
+        const data = await res.json();
+        let html = '<h2>Consensus Summary</h2>';
+        for (const key in data) {
+            if (Array.isArray(data[key]) && data[key].length > 0) {
+                const title = key.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+                html += `<details open><summary>${title}</summary><ul>`;
+                data[key].forEach(item => {
+                    const safeItem = String(item).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+                    html += `<li>${safeItem}</li>`;
+                });
+                html += '</ul></details>';
+            }
         }
-      });
-      html += '</ul></details>';
+        structuredContainer.innerHTML = html;
+    } catch (e) {
+        // Fail silently if structured summary can't be loaded/parsed
+        console.warn(`Could not load structured summary from ${url}:`, e);
     }
-  });
-  structuredEl.innerHTML = hasAny ? html : '<p class="muted">No structured reducer data found.</p>';
-}
-
-function escapeHtml(s) {
-  return String(s)
-    .replaceAll('&','&amp;')
-    .replaceAll('<','&lt;')
-    .replaceAll('>','&gt;')
-    .replaceAll('"','&quot;')
-    .replaceAll("\\'","&#39;");
 }
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -571,8 +518,14 @@ document.addEventListener('DOMContentLoaded', () => {
 </script>
 </body>
 </html>
-'''
+"""
+    data = []
+    for s in sessions:
+        rounds = sorted([p.name for p in s.glob("round_*") if (p / "mash_merged.md").exists()], reverse=True)
+        if rounds:
+            data.append({"name": s.name, "rounds": rounds})
     html = html.replace("%SESSIONS%", json.dumps(data))
+    reducer_name = CONFIG.get("reducer", {}).get("name")
     html = html.replace("%REDUCER_NAME%", json.dumps(reducer_name))
     write_text(MASH_DIR / "index.html", html)
 
@@ -588,45 +541,8 @@ def cmd_serve(args):
     print(f"Serving {MASH_DIR} on http://127.0.0.1:{port}  (Ctrl+C to stop)")
     ThreadingHTTPServer(("127.0.0.1", port), SimpleHTTPRequestHandler).serve_forever()
 
-def cmd_issues(args):
-    """Generate gh issue create commands from the latest reducer output."""
-    session_dir = latest_session_dir()
-    if not session_dir:
-        raise SystemExit("No sessions found.")
-
-    rounds = sorted(session_dir.glob("round_*"))
-    if not rounds:
-        raise SystemExit("No rounds found in session.")
-
-    reducer_name = CONFIG.get("reducer", {}).get("name", "reducer")
-    structured_json_path = rounds[-1] / "responses" / f"_{reducer_name}_structured.json"
-
-    if not structured_json_path.exists():
-        raise SystemExit(f"No structured reducer output found at: {structured_json_path}")
-
-    try:
-        data = json.loads(read_text(structured_json_path))
-        actions = data.get("next_actions", [])
-        if not actions:
-            print("No 'next_actions' found in structured output.")
-            return
-
-        print("#!/bin/bash")
-        print("# Run these commands to create issues in your repository.")
-        for action in actions:
-            # Basic shell escaping for the title
-            title = action.replace('"', '\\"')
-            owner_repo = f'--repo {args.owner_repo}' if args.owner_repo else ''
-            print(f'gh issue create --title "{title}" --body "" {owner_repo}')
-
-    except json.JSONDecodeError:
-        raise SystemExit(f"Failed to parse JSON from {structured_json_path}")
-    except Exception as e:
-        raise SystemExit(f"An error occurred: {e}")
-
 # --- CLI ---
 def main():
-    global CONFIG
     parser = argparse.ArgumentParser(
         description="Orchestrate a multi-AI chorus with provenance, overrides, reducer, and a simple web viewer.",
         formatter_class=argparse.RawTextHelpFormatter,
@@ -666,6 +582,13 @@ Example Resubmit Workflow:
     p_loop.add_argument("--no-reducer", action="store_true", help="Skip reducer for all rounds.")
     p_loop.set_defaults(func=cmd_loop)
 
+    p_index = sub.add_parser("index", help="Generate mash_runs/index.html viewer.")
+    p_index.set_defaults(func=cmd_index)
+
+    p_serve = sub.add_parser("serve", help="Serve mash_runs/ with a tiny HTTP server.")
+    p_serve.add_argument("--port", type=int, default=8888)
+    p_serve.set_defaults(func=cmd_serve)
+
     p_export = sub.add_parser("export", help="Export artifacts from the latest round.")
     p_export.add_argument(
         "--mode",
@@ -691,32 +614,7 @@ Example Resubmit Workflow:
     p_resubmit.add_argument("--no-reducer", action="store_true", help="Skip reducer for this run.")
     p_resubmit.set_defaults(func=cmd_resubmit)
 
-    p_index = sub.add_parser("index", help="Generate mash_runs/index.html viewer.")
-    p_index.set_defaults(func=cmd_index)
-
-    p_serve = sub.add_parser("serve", help="Serve mash_runs/ with a tiny HTTP server.")
-    p_serve.add_argument("--port", type=int, default=8888)
-    p_serve.set_defaults(func=cmd_serve)
-
-    # New command for generating issues
-    p_issues = sub.add_parser("issues", help="Generate issue creation commands from the latest structured reducer output.")
-    p_issues.add_argument("--owner-repo", help="Optional: GitHub owner/repo to create issues in.")
-    p_issues.set_defaults(func=cmd_issues)
-
-    # This needs to be here, after all files are created.
-    try:
-        CONFIG = load_config()
-    except SystemExit as e:
-        # We can ignore this if the config file doesn't exist yet,
-        # as the user might be about to create it.
-        pass
-
     args = parser.parse_args()
-
-    # Reload config just in case it was created after initial load
-    if not CONFIG:
-        CONFIG = load_config()
-
     args.func(args)
 
 if __name__ == "__main__":

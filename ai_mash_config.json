@@ -1,45 +1,52 @@
 {
-  "defaults": {
-    "temperature": 0.7,
-    "max_tokens": 4096
-  },
-  "limits": {
-    "max_context_chars": 48000
-  },
-  "agents": [
-    {
-      "name": "engineer",
-      "type": "openai",
-      "model": "local-model",
-      "base_url": "http://localhost:1234/v1",
-      "api_key": "lm-studio",
-      "system": "You are a senior software engineer. Provide detailed, practical, and efficient solutions.",
-      "overrides": {
-        "temperature": 0.2
-      }
+    "agents": [
+        {
+            "name": "lmstudio-deepseek",
+            "type": "openai",
+            "base_url": "http://127.0.0.1:1234/v1",
+            "model": "deepseek-coder",
+            "api_key": "lm-studio",
+            "system": "You are a helpful engineer collaborating in a multi-AI chorus. Be precise and deterministic."
+        },
+        {
+            "name": "lmstudio-llama",
+            "type": "openai",
+            "base_url": "http://127.0.0.1:1234/v1",
+            "model": "llama-3.1-8b-instruct",
+            "api_key": "lm-studio",
+            "system": "You are a creative architect in a multi-AI chorus. Offer novel perspectives and high-level structural ideas.",
+            "overrides": {
+                "temperature": 0.7,
+                "top_p": 0.9
+            }
+        },
+        {
+            "name": "gemini",
+            "type": "manual"
+        }
+    ],
+    "defaults": {
+        "temperature": 0.2,
+        "max_tokens": 1500
     },
-    {
-      "name": "architect",
-      "type": "openai",
-      "model": "local-model",
-      "base_url": "http://localhost:1234/v1",
-      "api_key": "lm-studio",
-      "system": "You are a systems architect. Focus on high-level structure, scalability, and long-term maintainability.",
-      "overrides": {
-        "temperature": 0.9
-      }
+    "reducer": {
+        "enabled": true,
+        "name": "lmstudio-reducer",
+        "type": "openai",
+        "base_url": "http://127.0.0.1:1234/v1",
+        "model": "llama-3.1-8b-instruct",
+        "api_key": "lm-studio",
+        "system": "You are a consensus reducer. Your task is to read the inputs from multiple AI collaborators. Summarize the key points, identify areas of agreement, and clearly state any disagreements or alternative proposals. Be objective and concise.",
+        "overrides": {
+            "temperature": 0.1
+        }
+    },
+    "export_prompts": {
+        "summary": "You are a summarization agent. Your task is to read the provided text and create a concise, distilled summary. Focus on the key takeaways and main conclusions.",
+        "roadmap": "You are a planning agent. Your task is to analyze the provided text and generate a structured roadmap with milestones, phases, and deliverables. The output must be in JSON format, like: {\"phase\": string, \"goals\": string[], \"tasks\": string[], \"timeline\": string}.",
+        "tasks": "You are a task breakdown agent. Your task is to analyze the provided text and break it down into a list of atomic tasks that could be given to another AI agent. The output must be a YAML-formatted list of tasks, where each task has a 'task', 'agent' (e.g., 'coder', 'writer'), and 'priority' (high/medium/low) field."
+    },
+    "limits": {
+        "max_context_chars": 48000
     }
-  ],
-  "reducer": {
-    "name": "reducer",
-    "enabled": true,
-    "type": "openai",
-    "model": "local-model",
-    "base_url": "http://localhost:1234/v1",
-    "api_key": "lm-studio",
-    "system": "You are a consensus-building agent. Analyze the provided responses and generate a summary of agreements, disagreements, open questions, and actionable next steps. Output the result as a human-readable summary, followed by a structured JSON block starting with 'JSON:'.",
-    "overrides": {
-      "temperature": 0.1
-    }
-  }
 }
