@@ -1,0 +1,146 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<title>AI Mash Viewer</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<style>
+  :root { --border:#ddd; }
+  body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:0;display:flex;height:100vh}
+  .sidebar{width:360px;padding:16px;border-right:1px solid var(--border);overflow-y:auto}
+  .main{flex-grow:1;padding:16px;overflow-y:auto}
+  h1,h2{margin:0 0 8px}
+  label{display:block;margin-top:8px;margin-bottom:4px;font-weight:600}
+  select,button{font-size:14px;padding:6px 8px;width:100%;margin-bottom:8px}
+  #content{white-space:pre-wrap;font-family:Consolas,'Courier New',monospace;line-height:1.5;border:1px solid var(--border);border-radius:6px;padding:12px}
+  details{border:1px solid var(--border);border-radius:6px;padding:8px;margin-top:8px;background:#fafafa}
+  summary{font-weight:700;cursor:pointer}
+  ul{margin:8px 0 0;padding-left:20px}
+  .muted{color:#666}
+</style>
+</head>
+<body>
+  <div class="sidebar">
+    <h1>AI Mash Viewer</h1>
+    <label>Session</label>
+    <select id="session"></select>
+    <label>Round</label>
+    <select id="round"></select>
+    <button id="load">Load</button>
+    <div id="structured-summary"></div>
+  </div>
+  <div class="main">
+    <h2>Mash Content</h2>
+    <div id="content" class="muted">Select a session and round, then click Load.</div>
+  </div>
+
+<script>
+const sessions = [];
+const REDUCER_NAME = "reducer";
+const sessionSel = document.getElementById('session');
+const roundSel = document.getElementById('round');
+const contentEl = document.getElementById('content');
+const structuredEl = document.getElementById('structured-summary');
+const loadBtn = document.getElementById('load');
+
+function populateSessions() {
+  sessionSel.innerHTML = '';
+  sessions.forEach(s => {
+    const opt = document.createElement('option');
+    opt.value = s.name;
+    opt.textContent = s.name;
+    sessionSel.appendChild(opt);
+  });
+  sessionSel.addEventListener('change', onSessionChange);
+  onSessionChange();
+}
+
+function onSessionChange() {
+  roundSel.innerHTML = '';
+  const s = sessions.find(x => x.name === sessionSel.value);
+  (s ? s.rounds : []).forEach(r => {
+    const opt = document.createElement('option');
+    opt.value = r;
+    opt.textContent = r;
+    roundSel.appendChild(opt);
+  });
+}
+
+async function loadMash() {
+  const s = sessionSel.value;
+  const r = roundSel.value;
+  if (!s || !r) {
+    contentEl.textContent = 'Please select a valid session and round.';
+    return;
+  }
+  structuredEl.innerHTML = '';
+  const url = `${s}/${r}/mash_merged.md`;
+  contentEl.textContent = 'Loading ' + url + ' ...';
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(res.status + ' ' + res.statusText);
+    const txt = await res.text();
+    contentEl.textContent = txt;
+  } catch (e) {
+    contentEl.textContent = 'Failed to load: ' + e;
+  }
+  loadStructuredSummary(s, r);
+}
+
+async function loadStructuredSummary(session, round) {
+  if (!REDUCER_NAME) return;
+  const url = `${session}/${round}/responses/_${REDUCER_NAME}_structured.json`;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return; // it's fine if the file doesn't exist
+    const data = await res.json();
+    renderStructured(data);
+  } catch(e) {
+    console.warn('Could not load structured summary:', e);
+  }
+}
+
+function titleize(key) {
+  return key.replace(/_/g, ' ').replace(/\b\w/g, m => m.toUpperCase());
+}
+
+function renderStructured(data) {
+  let html = '<h2>Consensus Summary</h2>';
+  const sections = ['agreements','disagreements','open_questions','next_actions'];
+
+  let hasAny = false;
+  sections.forEach(key => {
+    if (!data.hasOwnProperty(key)) return;
+    const val = data[key];
+    if (Array.isArray(val) && val.length > 0) {
+      hasAny = true;
+      html += `<details open><summary>${titleize(key)}</summary><ul>`;
+      val.forEach(item => {
+        if (typeof item === 'string') {
+          html += `<li>${escapeHtml(item)}</li>`;
+        } else {
+          html += `<li><pre>${escapeHtml(JSON.stringify(item, null, 2))}</pre></li>`;
+        }
+      });
+      html += '</ul></details>';
+    }
+  });
+  structuredEl.innerHTML = hasAny ? html : '<p class="muted">No structured reducer data found.</p>';
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replaceAll('&','&amp;')
+    .replaceAll('<','&lt;')
+    .replaceAll('>','&gt;')
+    .replaceAll('"','&quot;')
+    .replaceAll("\'","&#39;");
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  populateSessions();
+  loadBtn.addEventListener('click', loadMash);
+});
+</script>
+</body>
+</html>

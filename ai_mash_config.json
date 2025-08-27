@@ -1,0 +1,45 @@
+{
+  "defaults": {
+    "temperature": 0.7,
+    "max_tokens": 4096
+  },
+  "limits": {
+    "max_context_chars": 48000
+  },
+  "agents": [
+    {
+      "name": "engineer",
+      "type": "openai",
+      "model": "local-model",
+      "base_url": "http://localhost:1234/v1",
+      "api_key": "lm-studio",
+      "system": "You are a senior software engineer. Provide detailed, practical, and efficient solutions.",
+      "overrides": {
+        "temperature": 0.2
+      }
+    },
+    {
+      "name": "architect",
+      "type": "openai",
+      "model": "local-model",
+      "base_url": "http://localhost:1234/v1",
+      "api_key": "lm-studio",
+      "system": "You are a systems architect. Focus on high-level structure, scalability, and long-term maintainability.",
+      "overrides": {
+        "temperature": 0.9
+      }
+    }
+  ],
+  "reducer": {
+    "name": "reducer",
+    "enabled": true,
+    "type": "openai",
+    "model": "local-model",
+    "base_url": "http://localhost:1234/v1",
+    "api_key": "lm-studio",
+    "system": "You are a consensus-building agent. Analyze the provided responses and generate a summary of agreements, disagreements, open questions, and actionable next steps. Output the result as a human-readable summary, followed by a structured JSON block starting with 'JSON:'.",
+    "overrides": {
+      "temperature": 0.1
+    }
+  }
+}
