@@ -1,0 +1,58 @@
+# -----------------------------------------------------------
+# Example Configuration for the Unified AI Ping-Pong Orchestrator
+# -----------------------------------------------------------
+# Used by `pingpong.py`. All settings can be configured in the GUI as well.
+
+# -- Model Definitions --
+# Define the models and their default system prompts.
+models:
+  a:
+    name: "Phi-3-mini-4k-instruct-Q4_K_M.gguf"
+    system_prompt: "You are Model A, a creative planner. You generate initial ideas and plans."
+    # Role-specific prompts can be defined for different patterns
+    system_prompt_planner: "You are a Senior Architect. Your task is to outline a clear, high-level plan or specification for the given prompt. Be creative and think about the structure."
+    system_prompt_reviser: "You are a Senior Engineer. Your task is to take the feedback from the critic and produce a revised, improved version of the plan or code."
+  b:
+    name: "Qwen2.5-Coder-1.5B-Instruct-Q4_K_M.gguf"
+    system_prompt: "You are Model B, a critical analyzer. You review and improve upon the previous response."
+    system_prompt_critic: "You are a meticulous Code Reviewer. Your task is to analyze the plan from the Architect. Identify potential flaws, suggest concrete improvements, and refine the details. If the plan is solid, provide the code implementation."
+
+# -- Server Endpoints --
+endpoints:
+  a: "http://localhost:1234"
+  b: "http://localhost:1234"
+
+# -- Conversation Settings --
+prompt: "Design a simple Python script that acts as a timer. It should be run from the command line and count down from a specified number of seconds."
+rounds: 3 # Note: for patterns, one 'round' completes the full pattern once.
+temperature: 0.4
+max_tokens: 1024
+context_budget: 8192
+stop_if: "FINAL_ANSWER"
+sleep: 0.2
+mode: "plan_critique" # The default conversation pattern to use.
+
+# -- Conversation Patterns (Optional) --
+# Define different sequences of interaction. Each step defines the model and its role.
+patterns:
+  pingpong:
+    - model: a
+    - model: b
+  plan_critique:
+    - model: a
+      role: planner
+    - model: b
+      role: critic
+    - model: a
+      role: reviser
+  debate:
+    - model: a
+      role: thesis
+    - model: b
+      role: antithesis
+    - model: a
+      role: synthesis
+
+# -- Logging --
+transcripts_dir: "transcripts"
+name: "python_timer_design"
