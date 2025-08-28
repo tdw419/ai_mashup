@@ -42,9 +42,9 @@
         }
     },
     "exporters": {
-      "summary_prompt": "Summarize the merged multi-AI results in 200–300 words. Focus on decisions, rationale, and immediate implications. Be concise and non-redundant.",
-      "roadmap_prompt": "From the merged multi-AI results, produce a project roadmap as strict JSON with keys: phases (array of {name, goals[], milestones[], risks[], timeline_hint}), and cross_cutting (risks[], assumptions[]).",
-      "tasks_prompt": "From the merged multi-AI results, produce an array of actionable tasks as strict JSON with fields: title, description, owner (role), priority (P0|P1|P2), estimate (hours), dependencies (titles[]). Keep tasks atomic and testable."
+        "summary_prompt": "Summarize the merged multi-AI results in 200\u2013300 words. Focus on decisions, rationale, and immediate implications. Be concise and non-redundant.",
+        "roadmap_prompt": "From the merged multi-AI results, produce a project roadmap as strict JSON with keys: phases (array of {name, goals[], milestones[], risks[], timeline_hint}), and cross_cutting (risks[], assumptions[]).",
+        "tasks_prompt": "From the merged multi-AI results, produce an array of actionable tasks as strict JSON with fields: title, description, owner (role), priority (P0|P1|P2), estimate (hours), dependencies (titles[]). Keep tasks atomic and testable."
     },
     "limits": {
         "max_context_chars": 48000

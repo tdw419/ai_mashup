@@ -42,7 +42,7 @@ CONFIG_FILE = ROOT / "ai_mash_config.json"
 # Global toggle (set by CLI flags) to skip reducer per run
 NO_REDUCER = False
 
-def load_config() -> Dict[str, Any]:
+def read_config() -> Dict[str, Any]:
     """Load agent, reducer, exporters, defaults, and limits from JSON config."""
     if not CONFIG_FILE.exists():
         raise SystemExit(f"Configuration file not found: {CONFIG_FILE}")
@@ -51,7 +51,14 @@ def load_config() -> Dict[str, Any]:
     except Exception as e:
         raise SystemExit(f"Failed to parse {CONFIG_FILE}: {e}")
 
-CONFIG = load_config()
+def write_config(data: Dict[str, Any]):
+    """Write data to the JSON config file with pretty-printing."""
+    try:
+        CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+    except Exception as e:
+        raise SystemExit(f"Failed to write to {CONFIG_FILE}: {e}")
+
+CONFIG = read_config()
 
 # --- Utilities ---
 def now_iso() -> str:
@@ -348,6 +355,138 @@ def cmd_issues(args):
         print(cmd)
     print("\nYou can copy-paste these commands or pipe them to a shell (e.g., | bash).")
 
+# --- Agent Management ---
+def _prompt_for_input(prompt_text, default=None):
+    """Helper to prompt user for input with a default value."""
+    prompt = f"{prompt_text} (default: {default}): " if default is not None else f"{prompt_text}: "
+    response = input(prompt).strip()
+    return response or default
+
+def cmd_agents_list(args):
+    """List all configured agents in a formatted table."""
+    config = read_config()
+    agents = config.get("agents", [])
+
+    if not agents:
+        print("No agents configured in ai_mash_config.json")
+        return
+
+    # Prepare data for tabulation
+    header = {"#": "#", "Name": "Name", "Model": "Model", "Type": "Type", "Endpoint": "Endpoint"}
+    rows = []
+    for i, agent in enumerate(agents):
+        rows.append({
+            "#": str(i + 1),
+            "Name": agent.get("name", "-"),
+            "Model": agent.get("model", "-"),
+            "Type": agent.get("type", "-"),
+            "Endpoint": agent.get("base_url", "-")
+        })
+
+    # Calculate column widths
+    widths = {key: len(str(value)) for key, value in header.items()}
+    for row in rows:
+        for key, value in row.items():
+            widths[key] = max(widths[key], len(str(value)))
+
+    # Print header
+    header_line = " | ".join(header[key].ljust(widths[key]) for key in header)
+    print(header_line)
+
+    # Print separator
+    separator_line = "-+-".join("-" * widths[key] for key in header)
+    print(separator_line)
+
+    # Print rows
+    for row in rows:
+        row_line = " | ".join(str(row[key]).ljust(widths[key]) for key in header)
+        print(row_line)
+
+def cmd_agents_add(args):
+    """Interactively add a new agent to the configuration."""
+    print("--- Add New Agent ---")
+    print("Enter the details for the new agent. Press Ctrl+C to cancel.")
+
+    try:
+        agent = {}
+        agent['name'] = _prompt_for_input("Agent Name (e.g., 'my-new-model')")
+        if not agent['name']:
+            print("\nAgent name cannot be empty. Aborting.")
+            return
+
+        agent['type'] = _prompt_for_input("Agent Type ('openai' or 'manual')", "openai")
+
+        if agent['type'] == 'openai':
+            agent['model'] = _prompt_for_input("Model Name (e.g., 'llama-3.1-8b-instruct')")
+            if not agent['model']:
+                print("\nModel name is required for 'openai' type agents. Aborting.")
+                return
+            agent['base_url'] = _prompt_for_input("Endpoint Base URL", "http://127.0.0.1:1234/v1")
+            agent['api_key'] = _prompt_for_input("API Key (optional, e.g., 'lm-studio')", "lm-studio")
+            system_prompt = _prompt_for_input("System Prompt (optional)")
+            if system_prompt:
+                agent['system'] = system_prompt
+
+        # Confirmation step
+        print("\n--- New Agent Summary ---")
+        print(json.dumps(agent, indent=2))
+        confirm = _prompt_for_input("Add this agent to config? (yes/no)", "yes")
+
+        if confirm.lower() in ["yes", "y"]:
+            config = read_config()
+            config.setdefault("agents", []).append(agent)
+            write_config(config)
+            print(f"\n✅ Agent '{agent['name']}' added successfully to ai_mash_config.json.")
+        else:
+            print("\nOperation cancelled. No changes were made.")
+
+    except (KeyboardInterrupt, EOFError):
+        print("\n\nOperation cancelled by user.")
+        return
+
+def cmd_agents_remove(args):
+    """Interactively remove an agent from the configuration."""
+    config = read_config()
+    agents = config.get("agents", [])
+
+    if not agents:
+        print("No agents to remove.")
+        return
+
+    print("--- Remove Agent ---")
+    cmd_agents_list(None)  # Reuse the list command to show agents
+
+    try:
+        choice_str = _prompt_for_input("\nEnter the number of the agent to remove")
+        if not choice_str or not choice_str.isdigit():
+            print("\nInvalid input. Please enter a number. Aborting.")
+            return
+
+        choice_idx = int(choice_str) - 1
+
+        if not (0 <= choice_idx < len(agents)):
+            print(f"\nInvalid number. Please enter a number between 1 and {len(agents)}. Aborting.")
+            return
+
+        agent_to_remove = agents[choice_idx]
+
+        print("\n--- Agent to be Removed ---")
+        print(json.dumps(agent_to_remove, indent=2))
+
+        confirm = _prompt_for_input(f"Are you sure you want to remove '{agent_to_remove.get('name')}'? (yes/no)", "no")
+
+        if confirm.lower() in ["yes", "y"]:
+            removed_agent = config["agents"].pop(choice_idx)
+            write_config(config)
+            print(f"\n✅ Agent '{removed_agent.get('name')}' has been removed.")
+        else:
+            print("\nOperation cancelled. No changes were made.")
+
+    except (KeyboardInterrupt, EOFError):
+        print("\n\nOperation cancelled by user.")
+        return
+
+
 # --- Command Handlers ---
 def cmd_where(_args):
     print(str(MASH_DIR))
@@ -575,6 +714,16 @@ def main():
     sub = parser.add_subparsers(dest="cmd", required=True)
     p_where = sub.add_parser("where", help="Show the artifacts directory.")
     p_where.set_defaults(func=cmd_where)
+
+    # Agent Management
+    p_agents = sub.add_parser("agents", help="Manage AI agents in the config file.")
+    agents_sub = p_agents.add_subparsers(dest="agents_cmd", required=True)
+    p_agents_list = agents_sub.add_parser("list", help="List all configured agents.")
+    p_agents_list.set_defaults(func=cmd_agents_list)
+    p_agents_add = agents_sub.add_parser("add", help="Interactively add a new agent to the config.")
+    p_agents_add.set_defaults(func=cmd_agents_add)
+    p_agents_remove = agents_sub.add_parser("remove", help="Interactively remove an agent from the config.")
+    p_agents_remove.set_defaults(func=cmd_agents_remove)
     p_ask = sub.add_parser("ask", help="Ask all callable agents; continue latest session.")
     p_ask.add_argument("prompt", nargs=argparse.REMAINDER, help="Prompt to send.")
     p_ask.add_argument("--no-reducer", action="store_true", help="Skip reducer for this run.")
