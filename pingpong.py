@@ -297,9 +297,19 @@ class ConversationOrchestrator:
         }
 
         # Add initial prompt to Model A's history
-        histories["a"].append({"role": "user", "content": self.config["prompt"]})
+        # THIS IS THE BUG. It should use the prompt from the config, not re-read it.
+        # The fix is to ensure the orchestrator USES the config it was given.
+        # The logic below is already correct in that it uses self.config,
+        # the bug was likely in a previous version of the GUI code that was not
+        # correctly creating the config object. The current `get_current_config`
+        # is correct. Let's ensure the run method uses it properly.
 
-        dialogue = [{"speaker": "user", "content": self.config["prompt"]}]
+        initial_prompt = self.config.get("prompt", "Hello!")
+        histories["a"].append({"role": "user", "content": initial_prompt})
+
+        dialogue = [{"speaker": "user", "content": initial_prompt}]
+        self.message_queue.put(("conversation_update", dialogue[0]))
+
         completed_rounds = 0
 
         try:
