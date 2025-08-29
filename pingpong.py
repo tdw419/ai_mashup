@@ -89,10 +89,16 @@ class EnhancedLMClient:
             "total_time": 0,
             "errors": 0
         }
+        # Add request lock to prevent concurrent requests
+        self.request_lock = threading.Lock()
 
     def chat_with_retry(self, messages: List[Dict], temperature: float = 0.7,
-                       max_tokens: int = 800, max_retries: int = 3) -> str:
-        """Chat with exponential backoff retry logic"""
+                       max_tokens: int = 800, top_p: float = 0.9,
+                       repetition_penalty: float = 1.1,
+                       presence_penalty: float = 0.0,
+                       frequency_penalty: float = 0.0,
+                       max_retries: int = 3) -> str:
+        """Chat with exponential backoff retry logic and request serialization"""
         url = f"{self.endpoint}/v1/chat/completions"
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -103,24 +109,30 @@ class EnhancedLMClient:
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
+            "top_p": top_p,
+            "repetition_penalty": repetition_penalty,
+            "presence_penalty": presence_penalty,
+            "frequency_penalty": frequency_penalty,
         }
 
         for attempt in range(max_retries + 1):
             try:
-                start_time = time.time()
-                response = requests.post(url, json=payload, headers=headers, timeout=300)
-                response.raise_for_status()
+                # Acquire lock to prevent concurrent requests to the same endpoint
+                with self.request_lock:
+                    start_time = time.time()
+                    response = requests.post(url, json=payload, headers=headers, timeout=300)
+                    response.raise_for_status()
 
-                elapsed = time.time() - start_time
-                data = response.json()
-                content = data["choices"][0]["message"]["content"]
+                    elapsed = time.time() - start_time
+                    data = response.json()
+                    content = data["choices"][0]["message"]["content"]
 
-                # Update metrics
-                self.performance_metrics["total_requests"] += 1
-                self.performance_metrics["total_tokens"] += len(content.split())  # Rough estimate
-                self.performance_metrics["total_time"] += elapsed
+                    # Update metrics
+                    self.performance_metrics["total_requests"] += 1
+                    self.performance_metrics["total_tokens"] += len(content.split())  # Rough estimate
+                    self.performance_metrics["total_time"] += elapsed
 
-                return content
+                    return content
 
             except requests.RequestException as e:
                 self.performance_metrics["errors"] += 1
@@ -128,8 +140,10 @@ class EnhancedLMClient:
                 if attempt == max_retries:
                     raise Exception(f"Request failed after {max_retries + 1} attempts: {str(e)}")
 
-                # Exponential backoff
-                wait_time = 2 ** attempt
+                # Exponential backoff with jitter
+                base_wait_time = 2 ** attempt
+                jitter = base_wait_time * 0.1  # 10% jitter
+                wait_time = base_wait_time + (jitter * (2 * (time.time() % 1) - 1))
                 time.sleep(wait_time)
 
     def get_metrics(self) -> Dict[str, float]:
@@ -146,13 +160,36 @@ class EnhancedLMClient:
         }
 
 def estimate_tokens(text: str) -> int:
-    """Improved token estimation using word count + character density"""
-    words = len(text.split())
-    chars = len(text)
-    # Heuristic: average between word-based (1.3 tokens/word) and char-based (4 chars/token)
-    word_estimate = words * 1.3
-    char_estimate = chars / 4
-    return int((word_estimate + char_estimate) / 2)
+    """Improved token estimation using character-based approach"""
+    # Average token is about 4 characters in English
+    return int(len(text) / 4.0)
+
+def truncate_history_aggressive(history: List[Dict], budget: int) -> List[Dict]:
+    """More aggressive truncation for smaller models"""
+    if budget <= 0 or not history:
+        return history
+
+    kept = []
+    total = 0
+
+    # Always keep system message
+    if history and history[0].get("role") == "system":
+        kept.append(history[0])
+        total += estimate_tokens(history[0].get("content", ""))
+        messages = history[1:]
+    else:
+        messages = history
+
+    # Keep only the last 2 exchanges maximum
+    for msg in reversed(messages[-4:]):  # Last 4 messages (2 exchanges)
+        token_count = estimate_tokens(msg.get("content", ""))
+        if total + token_count <= budget:
+            kept.append(msg)
+            total += token_count
+        else:
+            break
+
+    return kept[:1] + list(reversed(kept[1:]))
 
 def truncate_history_adaptive(history: List[Dict], budget: int, model_size_hint: str = "1.5B") -> List[Dict]:
     """Adaptive history truncation based on model size"""
@@ -173,6 +210,10 @@ def truncate_history_adaptive(history: List[Dict], budget: int, model_size_hint:
         if size in model_size_hint:
             budget = int(budget * multiplier)
             break
+
+    # For very small models, use aggressive truncation
+    if model_size_hint in ["1B", "1.5B"]:
+        return truncate_history_aggressive(history, budget)
 
     kept = []
     total = 0
@@ -233,8 +274,16 @@ class ConversationOrchestrator:
                 {"model": "a", "role": "thesis"},
                 {"model": "b", "role": "antithesis"},
                 {"model": "a", "role": "synthesis"}
+            ],
+            "api_design": [
+                {"model": "a", "role": "architect", "prompt": "Design the basic API structure"},
+                {"model": "b", "role": "reviewer", "prompt": "Review and suggest improvements"},
+                {"model": "a", "role": "architect", "prompt": "Incorporate feedback and add details"}
             ]
         }
+
+        # Add global request lock to prevent concurrent requests to the same server
+        self.global_request_lock = threading.Lock()
 
     def validate_setup(self) -> bool:
         """Validate models are loaded and responsive"""
@@ -275,14 +324,19 @@ class ConversationOrchestrator:
         if not self.validate_setup():
             return {"success": False, "error": "Model validation failed"}
 
+        # Initialize conversation state
+        pattern_name = self.config.get("mode", "pingpong")
+
+        # Add direct mode
+        if pattern_name == "direct":
+            return self._run_direct_mode()
+
         # Send initial prompt to GUI
         self.message_queue.put(("conversation_update", {
             "speaker": "user",
             "content": self.config["prompt"]
         }))
 
-        # Initialize conversation state
-        pattern_name = self.config.get("mode", "pingpong")
         pattern = self.patterns.get(pattern_name, self.patterns["pingpong"])
 
         # Extend pattern to fill rounds
@@ -291,25 +345,21 @@ class ConversationOrchestrator:
         for i in range(rounds):
             extended_pattern.append(pattern[i % len(pattern)])
 
+        # Initialize histories
         histories = {
-            "a": [{"role": "system", "content": self.config["models"]["a"]["system_prompt"]}],
-            "b": [{"role": "system", "content": self.config["models"]["b"]["system_prompt"]}]
+            "a": [],
+            "b": []
         }
 
+        # Only add system prompts if not in raw mode
+        if self.config.get("use_system_prompts", True):
+            histories["a"].append({"role": "system", "content": self.config["models"]["a"]["system_prompt"]})
+            histories["b"].append({"role": "system", "content": self.config["models"]["b"]["system_prompt"]})
+
         # Add initial prompt to Model A's history
-        # THIS IS THE BUG. It should use the prompt from the config, not re-read it.
-        # The fix is to ensure the orchestrator USES the config it was given.
-        # The logic below is already correct in that it uses self.config,
-        # the bug was likely in a previous version of the GUI code that was not
-        # correctly creating the config object. The current `get_current_config`
-        # is correct. Let's ensure the run method uses it properly.
+        histories["a"].append({"role": "user", "content": self.config["prompt"]})
 
-        initial_prompt = self.config.get("prompt", "Hello!")
-        histories["a"].append({"role": "user", "content": initial_prompt})
-
-        dialogue = [{"speaker": "user", "content": initial_prompt}]
-        self.message_queue.put(("conversation_update", dialogue[0]))
-
+        dialogue = [{"speaker": "user", "content": self.config["prompt"]}]
         completed_rounds = 0
 
         try:
@@ -332,21 +382,36 @@ class ConversationOrchestrator:
                 context_budget = self.config.get("context_budget", 6000)
                 history = truncate_history_adaptive(history, context_budget, model_name)
 
-                # Update role-specific system prompt if needed
-                if role == "planner":
-                    history[0] = {"role": "system", "content": "You are a system architect. Create clear, minimal specifications. End with 'SPEC_COMPLETE' if done."}
-                elif role == "critic":
-                    history[0] = {"role": "system", "content": "You are a code reviewer. Find issues and suggest improvements. Use 'FINAL_ANSWER' for final implementation."}
-                elif role == "reviser":
-                    history[0] = {"role": "system", "content": "You are a designer. Refine and improve the previous work based on feedback."}
+                # In raw mode, don't use role-specific system prompts
+                if not self.config.get("use_system_prompts", True):
+                    # Remove any system prompts from history
+                    history = [msg for msg in history if msg.get("role") != "system"]
+                else:
+                    # Update role-specific system prompt if needed
+                    if role == "planner":
+                        history[0] = {"role": "system", "content": "You are a system architect. Create clear, minimal specifications. End with 'SPEC_COMPLETE' if done."}
+                    elif role == "critic":
+                        history[0] = {"role": "system", "content": "You are a code reviewer. Find issues and suggest improvements. Use 'FINAL_ANSWER' for final implementation."}
+                    elif role == "reviser":
+                        history[0] = {"role": "system", "content": "You are a designer. Refine and improve the previous work based on feedback."}
+                    elif role == "architect":
+                        history[0] = {"role": "system", "content": "You are a senior API architect. Design clear, well-structured REST API specifications. Be creative and provide detailed examples. Always build upon previous responses, don't repeat them."}
+                    elif role == "reviewer":
+                        history[0] = {"role": "system", "content": "You are a code reviewer specializing in REST APIs. Your role is to critique, improve, and extend the API design with concrete implementation details. Focus on what's missing and provide new insights."}
 
                 # Get response
                 try:
-                    response = client.chat_with_retry(
-                        messages=history,
-                        temperature=self.config.get("temperature", 0.7),
-                        max_tokens=self.config.get("max_tokens", 800)
-                    )
+                    # Acquire global lock to prevent concurrent requests to the same server
+                    with self.global_request_lock:
+                        response = client.chat_with_retry(
+                            messages=history,
+                            temperature=self.config.get("temperature", 0.7),
+                            max_tokens=self.config.get("max_tokens", 800),
+                            top_p=self.config.get("top_p", 0.9),
+                            repetition_penalty=self.config.get("repetition_penalty", 1.1),
+                            presence_penalty=self.config.get("presence_penalty", 0.0),
+                            frequency_penalty=self.config.get("frequency_penalty", 0.0)
+                        )
 
                     # Send to GUI
                     self.message_queue.put(("conversation_update", {
@@ -383,13 +448,66 @@ class ConversationOrchestrator:
                     break
 
                 completed_rounds = round_num
-                time.sleep(self.config.get("sleep", 0.2))
+                # Increased sleep time to allow server to complete processing
+                time.sleep(self.config.get("sleep", 3.0))
 
         except Exception as e:
             return {"success": False, "error": str(e)}
 
         # Save transcript
         return self._save_transcript(dialogue, completed_rounds)
+
+    def _run_direct_mode(self) -> Dict[str, Any]:
+        """Run a direct prompt without conversation history"""
+        # Send initial prompt to GUI
+        self.message_queue.put(("conversation_update", {
+            "speaker": "user",
+            "content": self.config["prompt"]
+        }))
+
+        # Get model configuration
+        model_key = self.config.get("direct_model", "a")  # Default to model A
+        client = self.client_a if model_key == "a" else self.client_b
+
+        # Build minimal messages (no system prompt)
+        messages = [{"role": "user", "content": self.config["prompt"]}]
+
+        try:
+            self.message_queue.put(("status", f"Running direct prompt with Model {model_key.upper()}"))
+
+            # Get response with all parameters
+            with self.global_request_lock:
+                response = client.chat_with_retry(
+                    messages=messages,
+                    temperature=self.config.get("temperature", 0.7),
+                    max_tokens=self.config.get("max_tokens", 800),
+                    top_p=self.config.get("top_p", 0.9),
+                    repetition_penalty=self.config.get("repetition_penalty", 1.1),
+                    presence_penalty=self.config.get("presence_penalty", 0.0),
+                    frequency_penalty=self.config.get("frequency_penalty", 0.0)
+                )
+
+            # Send to GUI
+            self.message_queue.put(("conversation_update", {
+                "speaker": model_key.upper(),
+                "content": response
+            }))
+
+            # Update metrics
+            metrics = client.get_metrics()
+            self.message_queue.put(("metrics_update", {
+                "model_a": metrics if model_key == "a" else self.client_a.get_metrics(),
+                "model_b": metrics if model_key == "b" else self.client_b.get_metrics()
+            }))
+
+            # Save transcript
+            return self._save_transcript([
+                {"speaker": "user", "content": self.config["prompt"]},
+                {"speaker": model_key.upper(), "content": response}
+            ], 1)
+
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
     def _save_transcript(self, dialogue: List[Dict], completed_rounds: int) -> Dict[str, Any]:
         """Save transcript with enhanced metadata"""
@@ -456,7 +574,7 @@ class PingPongGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("LM Studio Ping-Pong Orchestrator")
-        self.root.geometry("1000x800")
+        self.root.geometry("1200x900")
         self.root.resizable(True, True)
 
         # Queue for thread communication
@@ -471,24 +589,29 @@ class PingPongGUI:
             "models": {
                 "a": {
                     "name": "qwen2.5-coder-1.5b",
-                    "system_prompt": "You are Model A, a creative planner and system architect."
+                    "system_prompt": "You are a senior API architect. Design clear, well-structured REST APIs with detailed examples."
                 },
                 "b": {
                     "name": "tinyllama-1.1b-chat-v1.0",
-                    "system_prompt": "You are Model B, a critical analyzer and code reviewer."
+                    "system_prompt": "You are a code reviewer. Suggest specific improvements and implementation details for API designs."
                 }
             },
             "endpoints": {"a": "http://localhost:1234", "b": "http://localhost:1234"},
             "prompt": "Design a minimal REST API with GET and POST endpoints.",
-            "rounds": 4,
-            "temperature": 0.7,
-            "max_tokens": 800,
-            "context_budget": 4000,  # Reduced for your smaller models
+            "rounds": 7,  # Set to 7 rounds as requested
+            "temperature": 0.7,  # LM Studio default
+            "top_p": 0.9,       # LM Studio default
+            "repetition_penalty": 1.1,  # LM Studio default
+            "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
+            "max_tokens": 800,  # LM Studio default
+            "context_budget": 1500,  # Much smaller for your hardware
             "stop_if": "FINAL_ANSWER",
-            "sleep": 0.2,
-            "mode": "plan_critique",
+            "sleep": 3.0,
+            "mode": "Raw",  # Default to Raw mode
+            "use_system_prompts": False,
             "transcripts_dir": "transcripts",
-            "name": "api_design"
+            "name": "gui_conversation"
         }
 
         self.setup_ui()
@@ -509,7 +632,7 @@ class PingPongGUI:
         notebook.grid(row=0, column=0, columnspan=3, sticky="nsew", pady=(0, 10))
         main_frame.rowconfigure(0, weight=1)
 
-        # Models tab (new)
+        # Models tab
         self.setup_models_tab(notebook)
 
         # Configuration tab
@@ -621,7 +744,7 @@ class PingPongGUI:
         hardware_text.insert("1.0",
             "Hardware: AMD Radeon 5600 Series (6GB VRAM estimated)\n"
             "Optimized for: qwen2.5-coder-1.5b + tinyllama-1.1b-chat-v1.0\n"
-            "Context budget reduced to 4000 tokens for better performance on smaller models")
+            "Context budget reduced to 1500 tokens for better performance on smaller models")
         hardware_text.config(state="disabled")
 
         # Endpoints section
@@ -642,7 +765,7 @@ class PingPongGUI:
         models_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 10))
 
         # Model A
-        ttk.Label(models_frame, text="Model A (Planner):").grid(row=0, column=0, sticky="w", padx=(0, 5))
+        ttk.Label(models_frame, text="Model A (Architect):").grid(row=0, column=0, sticky="w", padx=(0, 5))
         self.model_a_var = tk.StringVar(value=self.default_config["models"]["a"]["name"])
         self.model_a_combo = ttk.Combobox(models_frame, textvariable=self.model_a_var, width=40)
         self.model_a_combo.grid(row=0, column=1, sticky="ew")
@@ -655,7 +778,7 @@ class PingPongGUI:
         self.system_a_text.insert("1.0", self.default_config["models"]["a"]["system_prompt"])
 
         # Model B
-        ttk.Label(models_frame, text="Model B (Critic):").grid(row=2, column=0, sticky="w", padx=(0, 5), pady=(10, 0))
+        ttk.Label(models_frame, text="Model B (Reviewer):").grid(row=2, column=0, sticky="w", padx=(0, 5), pady=(10, 0))
         self.model_b_var = tk.StringVar(value=self.default_config["models"]["b"]["name"])
         self.model_b_combo = ttk.Combobox(models_frame, textvariable=self.model_b_var, width=40)
         self.model_b_combo.grid(row=2, column=1, sticky="ew", pady=(10, 0))
@@ -677,15 +800,15 @@ class PingPongGUI:
         self.prompt_text.insert("1.0", self.default_config["prompt"])
 
         ttk.Label(conv_frame, text="Mode:").grid(row=1, column=0, sticky="w", padx=(0, 5), pady=(10, 0))
-        self.mode_var = tk.StringVar(value=self.default_config["mode"])
+        self.mode_var = tk.StringVar(value="Raw")  # Default to Raw
         mode_combo = ttk.Combobox(conv_frame, textvariable=self.mode_var,
-                                  values=["pingpong", "plan_critique", "debate"],
+                                  values=["Raw", "Direct"],
                                   state="readonly", width=15)
         mode_combo.grid(row=1, column=1, sticky="w", pady=(10, 0))
 
-        ttk.Label(conv_frame, text="Rounds:").grid(row=1, column=2, sticky="w", padx=(20, 5), pady=(10, 0))
+        ttk.Label(conv_frame, text="Rounds:").grid(row=2, column=0, sticky="w", padx=(0, 5), pady=(10, 0))
         self.rounds_var = tk.IntVar(value=self.default_config["rounds"])
-        ttk.Spinbox(conv_frame, from_=1, to=20, textvariable=self.rounds_var, width=10).grid(row=1, column=3, sticky="w", pady=(10, 0))
+        ttk.Spinbox(conv_frame, from_=1, to=20, textvariable=self.rounds_var, width=10).grid(row=2, column=1, sticky="w", pady=(10, 0))
 
         conv_frame.columnconfigure(1, weight=1)
 
@@ -702,22 +825,104 @@ class PingPongGUI:
         self.temp_label.grid(row=0, column=2)
         temp_scale.configure(command=self.update_temp_label)
 
+        # Top P
+        ttk.Label(params_frame, text="Top P:").grid(row=1, column=0, sticky="w", pady=(5, 0))
+        self.top_p_var = tk.DoubleVar(value=self.default_config["top_p"])
+        top_p_scale = ttk.Scale(params_frame, from_=0.0, to=1.0, variable=self.top_p_var, orient="horizontal")
+        top_p_scale.grid(row=1, column=1, sticky="ew", padx=(5, 10), pady=(5, 0))
+        self.top_p_label = ttk.Label(params_frame, text=f"{self.top_p_var.get():.2f}")
+        self.top_p_label.grid(row=1, column=2, pady=(5, 0))
+        top_p_scale.configure(command=lambda v: self.top_p_label.config(text=f"{float(v):.2f}"))
+
+        # Repetition Penalty
+        ttk.Label(params_frame, text="Repetition Penalty:").grid(row=2, column=0, sticky="w", pady=(5, 0))
+        self.repetition_penalty_var = tk.DoubleVar(value=self.default_config["repetition_penalty"])
+        rep_scale = ttk.Scale(params_frame, from_=0.5, to=2.0, variable=self.repetition_penalty_var, orient="horizontal")
+        rep_scale.grid(row=2, column=1, sticky="ew", padx=(5, 10), pady=(5, 0))
+        self.rep_label = ttk.Label(params_frame, text=f"{self.repetition_penalty_var.get():.2f}")
+        self.rep_label.grid(row=2, column=2, pady=(5, 0))
+        rep_scale.configure(command=lambda v: self.rep_label.config(text=f"{float(v):.2f}"))
+
+        # Presence Penalty
+        ttk.Label(params_frame, text="Presence Penalty:").grid(row=3, column=0, sticky="w", pady=(5, 0))
+        self.presence_penalty_var = tk.DoubleVar(value=self.default_config["presence_penalty"])
+        pres_scale = ttk.Scale(params_frame, from_=-2.0, to=2.0, variable=self.presence_penalty_var, orient="horizontal")
+        pres_scale.grid(row=3, column=1, sticky="ew", padx=(5, 10), pady=(5, 0))
+        self.pres_label = ttk.Label(params_frame, text=f"{self.presence_penalty_var.get():.2f}")
+        self.pres_label.grid(row=3, column=2, pady=(5, 0))
+        pres_scale.configure(command=lambda v: self.pres_label.config(text=f"{float(v):.2f}"))
+
+        # Frequency Penalty
+        ttk.Label(params_frame, text="Frequency Penalty:").grid(row=4, column=0, sticky="w", pady=(5, 0))
+        self.frequency_penalty_var = tk.DoubleVar(value=self.default_config["frequency_penalty"])
+        freq_scale = ttk.Scale(params_frame, from_=-2.0, to=2.0, variable=self.frequency_penalty_var, orient="horizontal")
+        freq_scale.grid(row=4, column=1, sticky="ew", padx=(5, 10), pady=(5, 0))
+        self.freq_label = ttk.Label(params_frame, text=f"{self.frequency_penalty_var.get():.2f}")
+        self.freq_label.grid(row=4, column=2, pady=(5, 0))
+        freq_scale.configure(command=lambda v: self.freq_label.config(text=f"{float(v):.2f}"))
+
         # Max tokens
-        ttk.Label(params_frame, text="Max Tokens:").grid(row=0, column=3, sticky="w", padx=(20, 5))
+        ttk.Label(params_frame, text="Max Tokens:").grid(row=5, column=0, sticky="w", pady=(10, 0))
         self.max_tokens_var = tk.IntVar(value=self.default_config["max_tokens"])
-        ttk.Spinbox(params_frame, from_=100, to=4000, increment=100, textvariable=self.max_tokens_var, width=10).grid(row=0, column=4)
+        ttk.Spinbox(params_frame, from_=100, to=4000, increment=100, textvariable=self.max_tokens_var, width=10).grid(row=5, column=1, sticky="w", pady=(10, 0), padx=(5, 0))
 
         # Context budget
-        ttk.Label(params_frame, text="Context Budget:").grid(row=1, column=0, sticky="w", pady=(10, 0))
+        ttk.Label(params_frame, text="Context Budget:").grid(row=5, column=2, sticky="w", padx=(20, 5), pady=(10, 0))
         self.context_budget_var = tk.IntVar(value=self.default_config["context_budget"])
-        ttk.Spinbox(params_frame, from_=1000, to=16000, increment=1000, textvariable=self.context_budget_var, width=10).grid(row=1, column=1, sticky="w", pady=(10, 0), padx=(5, 0))
+        ttk.Spinbox(params_frame, from_=1000, to=16000, increment=1000, textvariable=self.context_budget_var, width=10).grid(row=5, column=3, sticky="w", pady=(10, 0))
+
+        # Sleep time between requests
+        ttk.Label(params_frame, text="Sleep Time (s):").grid(row=6, column=0, sticky="w", pady=(10, 0))
+        self.sleep_var = tk.DoubleVar(value=self.default_config["sleep"])
+        sleep_scale = ttk.Scale(params_frame, from_=0.1, to=5.0, variable=self.sleep_var, orient="horizontal")
+        sleep_scale.grid(row=6, column=1, sticky="ew", padx=(5, 10), pady=(10, 0))
+        self.sleep_label = ttk.Label(params_frame, text=f"{self.sleep_var.get():.1f}")
+        self.sleep_label.grid(row=6, column=2, pady=(10, 0))
+        sleep_scale.configure(command=lambda v: self.sleep_label.config(text=f"{float(v):.1f}"))
 
         # Stop condition
-        ttk.Label(params_frame, text="Stop If:").grid(row=1, column=2, sticky="w", padx=(20, 5), pady=(10, 0))
+        ttk.Label(params_frame, text="Stop If:").grid(row=7, column=0, sticky="w", padx=(0, 5), pady=(10, 0))
         self.stop_if_var = tk.StringVar(value=self.default_config.get("stop_if", ""))
-        ttk.Entry(params_frame, textvariable=self.stop_if_var, width=15).grid(row=1, column=3, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Entry(params_frame, textvariable=self.stop_if_var, width=15).grid(row=7, column=1, columnspan=3, sticky="w", pady=(10, 0))
 
         params_frame.columnconfigure(1, weight=1)
+
+        # System prompts toggle
+        system_frame = ttk.LabelFrame(config_frame, text="System Prompts", padding="10")
+        system_frame.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+
+        self.use_system_prompts_var = tk.BooleanVar(value=self.default_config["use_system_prompts"])
+        ttk.Checkbutton(system_frame, text="Use System Prompts",
+                        variable=self.use_system_prompts_var).grid(row=0, column=0, sticky="w")
+
+        # Parameter presets
+        preset_frame = ttk.LabelFrame(config_frame, text="Parameter Presets", padding="10")
+        preset_frame.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+
+        def apply_preset(preset_name):
+            presets = {
+                "Creative": {"temperature": 0.9, "top_p": 0.95, "repetition_penalty": 1.0},
+                "Balanced": {"temperature": 0.7, "top_p": 0.9, "repetition_penalty": 1.1},
+                "Precise": {"temperature": 0.3, "top_p": 0.7, "repetition_penalty": 1.2},
+                "LM Studio Default": {"temperature": 0.7, "top_p": 0.9, "repetition_penalty": 1.1},
+                "Hardware Optimized": {"temperature": 0.6, "top_p": 0.8, "repetition_penalty": 1.2}
+            }
+
+            if preset_name in presets:
+                preset = presets[preset_name]
+                self.temperature_var.set(preset["temperature"])
+                self.top_p_var.set(preset["top_p"])
+                self.repetition_penalty_var.set(preset["repetition_penalty"])
+                # Update labels
+                self.temp_label.config(text=f"{preset['temperature']:.1f}")
+                self.top_p_label.config(text=f"{preset['top_p']:.2f}")
+                self.rep_label.config(text=f"{preset['repetition_penalty']:.2f}")
+
+        ttk.Button(preset_frame, text="Creative", command=lambda: apply_preset("Creative")).pack(side="left", padx=2)
+        ttk.Button(preset_frame, text="Balanced", command=lambda: apply_preset("Balanced")).pack(side="left", padx=2)
+        ttk.Button(preset_frame, text="Precise", command=lambda: apply_preset("Precise")).pack(side="left", padx=2)
+        ttk.Button(preset_frame, text="LM Studio Default", command=lambda: apply_preset("LM Studio Default")).pack(side="left", padx=2)
+        ttk.Button(preset_frame, text="Hardware Optimized", command=lambda: apply_preset("Hardware Optimized")).pack(side="left", padx=2)
 
     def setup_conversation_tab(self, notebook):
         conv_frame = ttk.Frame(notebook, padding="10")
@@ -758,7 +963,9 @@ class PingPongGUI:
             "- Blue: Your initial prompt\n"
             "- Green: Model A responses\n"
             "- Purple: Model B responses\n"
-            "- Red: System messages\n\n")
+            "- Red: System messages\n\n"
+            "Raw Mode is enabled by default for the best LM Studio results.\n"
+            "Set to 7 rounds for multi-model conversations.\n")
 
     def setup_performance_tab(self, notebook):
         perf_frame = ttk.Frame(notebook, padding="10")
@@ -811,6 +1018,196 @@ class PingPongGUI:
 
     def update_temp_label(self, value):
         self.temp_label.config(text=f"{float(value):.1f}")
+
+    def refresh_model_list(self):
+        """Refresh the list of available models from LM Studio"""
+        endpoint = self.models_endpoint_var.get().strip()
+        if not endpoint:
+            self.connection_status.config(text="No endpoint specified", foreground="red")
+            return
+
+        # Update status
+        self.connection_status.config(text="Connecting...", foreground="orange")
+        self.refresh_models_btn.config(state="disabled")
+
+        def refresh_thread():
+            try:
+                # Test connection first
+                response = requests.get(f"{endpoint.rstrip('/')}/v1/models", timeout=10)
+                response.raise_for_status()
+
+                models_data = response.json().get("data", [])
+
+                # Process and categorize models
+                processed_models = []
+                for model in models_data:
+                    model_id = model.get("id", "")
+
+                    # Estimate model size and type from name
+                    size_est = self.estimate_model_size(model_id)
+                    model_type = self.categorize_model(model_id)
+
+                    processed_models.append({
+                        "id": model_id,
+                        "size": size_est,
+                        "type": model_type,
+                        "raw": model
+                    })
+
+                # Sort by size then name
+                processed_models.sort(key=lambda x: (x["size"], x["id"]))
+
+                # Update GUI in main thread
+                self.message_queue.put(("models_refreshed", {
+                    "success": True,
+                    "models": processed_models,
+                    "count": len(processed_models)
+                }))
+
+            except Exception as e:
+                self.message_queue.put(("models_refreshed", {
+                    "success": False,
+                    "error": str(e)
+                }))
+
+        threading.Thread(target=refresh_thread, daemon=True).start()
+
+    def estimate_model_size(self, model_name):
+        """Estimate model size from name"""
+        name_lower = model_name.lower()
+
+        # Common size indicators
+        if "1.1b" in name_lower or "1b" in name_lower:
+            return "1B"
+        elif "1.5b" in name_lower:
+            return "1.5B"
+        elif "3b" in name_lower:
+            return "3B"
+        elif "7b" in name_lower:
+            return "7B"
+        elif "8b" in name_lower:
+            return "8B"
+        elif "13b" in name_lower:
+            return "13B"
+        elif "30b" in name_lower or "34b" in name_lower:
+            return "30B+"
+        elif "70b" in name_lower:
+            return "70B+"
+        else:
+            return "Unknown"
+
+    def categorize_model(self, model_name):
+        """Categorize model type from name"""
+        name_lower = model_name.lower()
+
+        if "coder" in name_lower or "code" in name_lower:
+            return "Code"
+        elif "instruct" in name_lower or "chat" in name_lower:
+            return "Chat"
+        elif "vision" in name_lower:
+            return "Vision"
+        elif "embed" in name_lower:
+            return "Embedding"
+        else:
+            return "General"
+
+    def on_model_select(self, event):
+        """Handle model selection in the tree"""
+        selection = self.models_tree.selection()
+        if not selection:
+            return
+
+        item = self.models_tree.item(selection[0])
+        model_name = item["values"][0]
+
+        # Update details
+        details = f"Selected Model: {model_name}\n\n"
+        details += f"Estimated Size: {item['values'][1]}\n"
+        details += f"Type: {item['values'][2]}\n\n"
+
+        # Add hardware recommendations
+        size_est = item["values"][1]
+        if size_est in ["1B", "1.5B", "3B"]:
+            details += "✅ RECOMMENDED for your AMD Radeon 5600 Series\n"
+            details += "• Should run smoothly with available VRAM\n"
+            details += "• Good performance expected\n"
+        elif size_est in ["7B", "8B"]:
+            details += "⚠️  MARGINAL for your hardware\n"
+            details += "• May require CPU offloading\n"
+            details += "• Slower performance expected\n"
+        else:
+            details += "❌ NOT RECOMMENDED for your hardware\n"
+            details += "• Will likely be very slow\n"
+            details += "• High memory usage\n"
+
+        # Add usage suggestions
+        model_type = item["values"][2]
+        if model_type == "Code":
+            details += "\nSuggested Role: Model A (Raw Mode)\n"
+        elif model_type == "Chat":
+            details += "\nSuggested Role: Model A (Raw Mode) or Model B (General)\n"
+
+        self.model_details_text.delete("1.0", "end")
+        self.model_details_text.insert("1.0", details)
+
+    def use_as_model_a(self):
+        """Set selected model as Model A"""
+        selection = self.models_tree.selection()
+        if not selection:
+            messagebox.showwarning("No Selection", "Please select a model first")
+            return
+
+        item = self.models_tree.item(selection[0])
+        model_name = item["values"][0]
+
+        self.model_a_var.set(model_name)
+        messagebox.showinfo("Model Set", f"Model A set to: {model_name}")
+
+    def use_as_model_b(self):
+        """Set selected model as Model B"""
+        selection = self.models_tree.selection()
+        if not selection:
+            messagebox.showwarning("No Selection", "Please select a model first")
+            return
+
+        item = self.models_tree.item(selection[0])
+        model_name = item["values"][0]
+
+        self.model_b_var.set(model_name)
+        messagebox.showinfo("Model Set", f"Model B set to: {model_name}")
+
+    def test_selected_model(self):
+        """Test the selected model's responsiveness"""
+        selection = self.models_tree.selection()
+        if not selection:
+            messagebox.showwarning("No Selection", "Please select a model first")
+            return
+
+        item = self.models_tree.item(selection[0])
+        model_name = item["values"][0]
+
+        def test_thread():
+            try:
+                checker = ModelHealthChecker()
+                self.message_queue.put(("status", f"Testing model: {model_name}"))
+
+                result = checker.check_model(
+                    self.models_endpoint_var.get(),
+                    model_name
+                )
+
+                self.message_queue.put(("model_test_result", {
+                    "model": model_name,
+                    "result": result
+                }))
+
+            except Exception as e:
+                self.message_queue.put(("model_test_result", {
+                    "model": model_name,
+                    "result": {"available": False, "error": str(e)}
+                }))
+
+        threading.Thread(target=test_thread, daemon=True).start()
 
     def fetch_models(self):
         """Fetch available models from the LM Studio server and populate dropdowns"""
@@ -890,7 +1287,9 @@ class PingPongGUI:
         system_a = self.system_a_text.get("1.0", "end-1c")
         system_b = self.system_b_text.get("1.0", "end-1c")
 
-        return {
+        gui_mode = self.mode_var.get()
+
+        config = {
             "models": {
                 "a": {
                     "name": self.model_a_var.get(),
@@ -908,14 +1307,27 @@ class PingPongGUI:
             "prompt": prompt,
             "rounds": self.rounds_var.get(),
             "temperature": self.temperature_var.get(),
+            "top_p": self.top_p_var.get(),
+            "repetition_penalty": self.repetition_penalty_var.get(),
+            "presence_penalty": self.presence_penalty_var.get(),
+            "frequency_penalty": self.frequency_penalty_var.get(),
             "max_tokens": self.max_tokens_var.get(),
             "context_budget": self.context_budget_var.get(),
+            "sleep": self.sleep_var.get(),
             "stop_if": self.stop_if_var.get(),
-            "sleep": 0.2,
-            "mode": self.mode_var.get(),
             "transcripts_dir": "transcripts",
             "name": "gui_conversation"
         }
+
+        if gui_mode == "Direct":
+            config["mode"] = "direct"
+            config["use_system_prompts"] = False
+            config["direct_model"] = "a"
+        else:  # Raw
+            config["mode"] = "pingpong"
+            config["use_system_prompts"] = False
+
+        return config
 
     def start_conversation(self):
         """Start the conversation in a separate thread"""
@@ -1091,14 +1503,12 @@ class PingPongGUI:
         self.metrics_a_text.delete("1.0", "end")
         if model_a_metrics and model_a_metrics.get('total_requests', 0) > 0:
             metrics_text = f"""Model: {self.model_a_var.get()}
-
 Performance Metrics:
 ├─ Average Response Time: {model_a_metrics.get('avg_response_time', 0):.1f}s
 ├─ Tokens per Second: {model_a_metrics.get('tokens_per_second', 0):.1f}
 ├─ Error Rate: {model_a_metrics.get('error_rate', 0):.1%}
 ├─ Total Requests: {model_a_metrics.get('total_requests', 0)}
 └─ Total Tokens: {model_a_metrics.get('total_tokens', 0)}
-
 Hardware Notes:
 • Running on AMD Radeon 5600 Series
 • Optimized context budget for 1.5B model
@@ -1111,14 +1521,12 @@ Hardware Notes:
         self.metrics_b_text.delete("1.0", "end")
         if model_b_metrics and model_b_metrics.get('total_requests', 0) > 0:
             metrics_text = f"""Model: {self.model_b_var.get()}
-
 Performance Metrics:
 ├─ Average Response Time: {model_b_metrics.get('avg_response_time', 0):.1f}s
 ├─ Tokens per Second: {model_b_metrics.get('tokens_per_second', 0):.1f}
 ├─ Error Rate: {model_b_metrics.get('error_rate', 0):.1%}
 ├─ Total Requests: {model_b_metrics.get('total_requests', 0)}
 └─ Total Tokens: {model_b_metrics.get('total_tokens', 0)}
-
 Hardware Notes:
 • Running on AMD Radeon 5600 Series
 • Optimized context budget for 1.1B model
@@ -1202,14 +1610,31 @@ Hardware Notes:
                 self.rounds_var.set(config["rounds"])
             if "temperature" in config:
                 self.temperature_var.set(config["temperature"])
+            if "top_p" in config:
+                self.top_p_var.set(config["top_p"])
+            if "repetition_penalty" in config:
+                self.repetition_penalty_var.set(config["repetition_penalty"])
+            if "presence_penalty" in config:
+                self.presence_penalty_var.set(config["presence_penalty"])
+            if "frequency_penalty" in config:
+                self.frequency_penalty_var.set(config["frequency_penalty"])
             if "max_tokens" in config:
                 self.max_tokens_var.set(config["max_tokens"])
             if "context_budget" in config:
                 self.context_budget_var.set(config["context_budget"])
+            if "sleep" in config:
+                self.sleep_var.set(config["sleep"])
             if "stop_if" in config:
                 self.stop_if_var.set(config["stop_if"])
             if "mode" in config:
                 self.mode_var.set(config["mode"])
+            if "direct_model" in config:
+                self.direct_model_var.set(config["direct_model"])
+            if "use_system_prompts" in config:
+                self.use_system_prompts_var.set(config["use_system_prompts"])
+            if "raw_mode" in config:
+                self.raw_mode_var.set(config["raw_mode"])
+                self.toggle_raw_mode()
 
         except Exception as e:
             messagebox.showerror("Error", f"Failed to apply config: {str(e)}")
@@ -1232,7 +1657,7 @@ def main():
 
     # Add some basic keyboard shortcuts
     root.bind('<Control-q>', lambda e: root.quit())
-    root.bind('<F5>', lambda e: app.refresh_model_list())
+    root.bind('<F5>', lambda e: app.fetch_models())
 
     try:
         root.mainloop()
