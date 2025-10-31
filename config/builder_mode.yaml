@@ -1,0 +1,13 @@
+builder_mode: true
+solutions_per_problem: 1.5         # target ratio (>=1 solution per problem, prefer 1.5)
+require_week1_deliverable: true
+tone_policy: confident|pragmatic|exploratory
+deep_think_on_fail: 2              # extra regen passes if gates fail
+history:
+  provider: lancedb                # or "files", "sqlite", etc.
+  top_k: 5
+  time_decay_days: 30
+quality_gates:
+  min_actionability: 0.75          # 0-1
+  min_specificity: 0.70            # 0-1
+  max_vague_ratio: 0.30            # vague sentences / total

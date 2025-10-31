@@ -29,6 +29,9 @@ import zipfile
 import shlex
 from datetime import datetime
 from typing import Dict, Any, List, Optional
+import yaml
+from engine.workflow import BuilderFirstWorkflow
+
 try:
     import requests
     import pyperclip
@@ -39,6 +42,8 @@ except ImportError:
 ROOT = pathlib.Path(__file__).parent.resolve()
 MASH_DIR = ROOT / "mash_runs"
 CONFIG_FILE = ROOT / "ai_mash_config.json"
+BUILDER_CONFIG_FILE = ROOT / "config" / "builder_mode.yaml"
+
 # Global toggle (set by CLI flags) to skip reducer per run
 NO_REDUCER = False
 
@@ -51,7 +56,23 @@ def load_config() -> Dict[str, Any]:
     except Exception as e:
         raise SystemExit(f"Failed to parse {CONFIG_FILE}: {e}")
 
+def load_builder_config() -> Dict[str, Any]:
+    """Load builder mode configuration from YAML."""
+    if not BUILDER_CONFIG_FILE.exists():
+        raise SystemExit(f"Builder config file not found: {BUILDER_CONFIG_FILE}")
+    try:
+        return yaml.safe_load(BUILDER_CONFIG_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise SystemExit(f"Failed to parse {BUILDER_CONFIG_FILE}: {e}")
+
 CONFIG = load_config()
+BUILDER_CONFIG = None  # Loaded on demand
+
+# Dummy vector store for HistoryRAG dependency
+class DummyVecDB:
+    def search(self, query: str, top_k: int) -> list:
+        print(f"DummyVecDB: Searching for '{query}' with top_k={top_k}. Returning no results.")
+        return []
 
 # --- Utilities ---
 def now_iso() -> str:
@@ -144,12 +165,41 @@ def merge_round(responses_dir: pathlib.Path) -> str:
     header = f"# Multi-AI Mash (merged at {now_iso()})\n"
     return header + "".join(parts)
 
-def run_round(session_dir: pathlib.Path, round_idx: int, prompt: str, prev_mash: Optional[str]):
+def run_round(session_dir: pathlib.Path, round_idx: int, prompt: str, prev_mash: Optional[str], builder_mode: bool = False):
     """Execute one round against all callable agents and write provenance."""
     round_dir = session_dir / f"round_{round_idx:02d}"
     responses_dir = round_dir / "responses"
     ensure_dir(responses_dir)
     print(f"\n=== Round {round_idx:02d} ===")
+
+    if builder_mode:
+        global BUILDER_CONFIG
+        if BUILDER_CONFIG is None:
+            BUILDER_CONFIG = load_builder_config()
+
+        print("Running in Builder-First Mode...")
+        # Use the first agent from the main config for the builder workflow
+        builder_agent_config = next((agent for agent in CONFIG.get("agents", []) if agent.get("type") == "openai"), None)
+        if not builder_agent_config:
+            raise SystemExit("No OpenAI-compatible agent found in config for Builder-First mode.")
+
+        def llm_fn(p: str) -> str:
+            messages = [{"role": "user", "content": p}]
+            return openai_chat(builder_agent_config, messages)
+
+        workflow = BuilderFirstWorkflow(llm=llm_fn, vecdb=DummyVecDB(), cfg=BUILDER_CONFIG)
+        final_response, report = workflow.run(prompt)
+
+        out_md = responses_dir / "builder_response.md"
+        write_text(out_md, final_response)
+        write_text(out_md.with_suffix(".json"), json.dumps(report.__dict__, indent=2))
+
+        merged = f"# Builder-First Response\n\n{final_response}\n\n## Gate Report\n\n```json\n{json.dumps(report.__dict__, indent=2)}\n```"
+        write_text(round_dir / "mash_merged.md", merged)
+        print(f"Round {round_idx:02d} (Builder Mode) → {round_dir / 'mash_merged.md'}")
+        return
+
+    # Original multi-agent chorus logic
     for agent in CONFIG.get("agents", []):
         if agent.get("type") != "openai":
             continue
@@ -167,7 +217,9 @@ def run_round(session_dir: pathlib.Path, round_idx: int, prompt: str, prev_mash:
                 )
             })
         messages.append({"role": "user", "content": prompt})
+
         content = openai_chat(agent, messages)
+
         out_md = responses_dir / f"{agent['name']}.md"
         write_text(out_md, content)
         effective_params = CONFIG.get("defaults", {}).copy()
@@ -182,8 +234,10 @@ def run_round(session_dir: pathlib.Path, round_idx: int, prompt: str, prev_mash:
             "effective_params": effective_params
         }
         write_text(out_md.with_suffix(".json"), json.dumps(meta, indent=2))
+
     merged = merge_round(responses_dir)
     reducer_agent = CONFIG.get("reducer")
+
     if (not NO_REDUCER and reducer_agent and reducer_agent.get("enabled")
             and reducer_agent.get("type") == "openai"):
         print(f"Running consensus reducer ({reducer_agent.get('name', 'reducer')})...")
@@ -229,6 +283,7 @@ def run_round(session_dir: pathlib.Path, round_idx: int, prompt: str, prev_mash:
             }, indent=2)
         )
         merged += f"\n\n---\n# Consensus Summary\n\n{summary}\n"
+
     write_text(round_dir / "mash_merged.md", merged)
     print(f"Round {round_idx:02d} → {round_dir / 'mash_merged.md'}")
 
@@ -355,6 +410,7 @@ def cmd_where(_args):
 def cmd_ask(args):
     global NO_REDUCER
     NO_REDUCER = bool(getattr(args, "no_reducer", False))
+    builder_mode = bool(getattr(args, "builder", False))
     session_dir = latest_session_dir() or new_session_dir()
     rounds = sorted(session_dir.glob("round_*"))
     if rounds:
@@ -365,7 +421,7 @@ def cmd_ask(args):
     else:
         prev_mash, next_idx = None, 1
     prompt = " ".join(args.prompt)
-    run_round(session_dir, next_idx, prompt, prev_mash)
+    run_round(session_dir, next_idx, prompt, prev_mash, builder_mode)
     print(f"\nSuccess → {session_dir / f'round_{next_idx:02d}' / 'mash_merged.md'}")
 
 def cmd_append(args):
@@ -393,11 +449,12 @@ def cmd_append(args):
 def cmd_loop(args):
     global NO_REDUCER
     NO_REDUCER = bool(getattr(args, "no_reducer", False))
+    builder_mode = bool(getattr(args, "builder", False))
     session_dir = new_session_dir()
     prev_mash = None
     prompt = " ".join(args.prompt)
     for i in range(1, args.rounds + 1):
-        run_round(session_dir, i, prompt, prev_mash)
+        run_round(session_dir, i, prompt, prev_mash, builder_mode)
         mash_path = session_dir / f"round_{i:02d}" / "mash_merged.md"
         prev_mash = read_text(mash_path)
         prompt = "Please review the context and provide the next logical step, refinement, or implementation."
@@ -578,6 +635,7 @@ def main():
     p_ask = sub.add_parser("ask", help="Ask all callable agents; continue latest session.")
     p_ask.add_argument("prompt", nargs=argparse.REMAINDER, help="Prompt to send.")
     p_ask.add_argument("--no-reducer", action="store_true", help="Skip reducer for this run.")
+    p_ask.add_argument("--builder", action="store_true", help="Use Builder-First workflow.")
     p_ask.set_defaults(func=cmd_ask)
     p_append = sub.add_parser("append", help="Append a manual response to latest round.")
     p_append.add_argument("--agent", required=True, help="Agent name, e.g., 'gemini'.")
@@ -590,6 +648,7 @@ def main():
     p_loop.add_argument("--rounds", type=int, default=3, help="Number of rounds.")
     p_loop.add_argument("prompt", nargs=argparse.REMAINDER, help="Initial prompt.")
     p_loop.add_argument("--no-reducer", action="store_true", help="Skip reducer for all rounds.")
+    p_loop.add_argument("--builder", action="store_true", help="Use Builder-First workflow for all rounds.")
     p_loop.set_defaults(func=cmd_loop)
     p_export = sub.add_parser("export", help="Export artifacts from a round.")
     p_export.add_argument("--mode", choices=["full", "summary", "roadmap", "tasks"], required=True,

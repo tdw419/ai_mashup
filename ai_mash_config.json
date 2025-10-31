@@ -48,5 +48,22 @@
     },
     "limits": {
         "max_context_chars": 48000
+    },
+    "builder_mode": {
+        "enabled": false,
+        "problem_to_solution_ratio": 1.5,
+        "solution_generation_prompt": "Based on your previous analysis, generate SOLUTIONS for each challenge identified. For every problem, provide 2-3 concrete solution pathways with implementation details. Be bold and constructive.",
+        "builder_reducer": {
+            "enabled": true,
+            "name": "lmstudio-builder-reducer",
+            "type": "openai",
+            "base_url": "http://127.0.0.1:1234/v1",
+            "model": "llama-3.1-8b-instruct",
+            "api_key": "lm-studio",
+            "system": "You are a 'Builder-First' consensus reducer. Your task is to synthesize the multi-AI responses with a strong bias towards action. For every problem identified, ensure there is a concrete solution proposed. Your output must be a clear, actionable plan. Structure your response with: 1) A list of problems and their corresponding solutions, 2) A consolidated, actionable roadmap, and 3) A list of open questions that require further investigation.",
+            "overrides": {
+                "temperature": 0.1
+            }
+        }
     }
 }
