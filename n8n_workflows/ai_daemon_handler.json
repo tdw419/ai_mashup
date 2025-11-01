@@ -1,0 +1,80 @@
+{
+  "name": "AI Daemon Handler",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "ai-daemon-alert",
+        "responseMode": "responseNode"
+      },
+      "id": "http-trigger",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.httpTrigger",
+      "typeVersion": 1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "authentication": "lmStudioLocal",
+        "url": "http://localhost:1234/v1/chat/completions",
+        "options": {
+          "retryOnFail": true,
+          "retryCount": 3,
+          "retryInterval": 10000
+        },
+        "method": "POST",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "model",
+              "value": "codellama-7b-instruct.q4_K_M"
+            },
+            {
+              "name": "messages",
+              "value": "={{[{ role: 'system', content: 'You are a system administrator AI. You have received an alert about system resources. Analyze the alert and suggest a course of action.' }, { role: 'user', content: `Alert: {{ $json.body.message }}` }]}}"
+            }
+          ]
+        }
+      },
+      "id": "llm-analyzer",
+      "name": "LLM Analyzer",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "url": "http://localhost:5002/update",
+        "method": "POST",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "last_alert_analysis",
+              "value": "={{ $json.choices[0].message.content }}"
+            }
+          ]
+        }
+      },
+      "id": "update-daemon-status",
+      "name": "Update Daemon Status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "responseCode": 200,
+        "responseBody": "{\\"message\\":\\"Alert received and processed\\"}"
+      },
+      "id": "http-response",
+      "name": "HTTP Response",
+      "type": "n8n-nodes-base.httpResponse",
+      "typeVersion": 1,
+      "position": [900, 300]
+    }
+  ],
+  "connections": {
+    "http-trigger": { "main": [ [ { "node": "llm-analyzer", "type": "main", "index": 0 } ] ] },
+    "llm-analyzer": { "main": [ [ { "node": "update-daemon-status", "type": "main", "index": 0 } ] ] },
+    "update-daemon-status": { "main": [ [ { "node": "http-response", "type": "main", "index": 0 } ] ] }
+  }
+}

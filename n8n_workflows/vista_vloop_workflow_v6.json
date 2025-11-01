@@ -1,0 +1,70 @@
+{
+  "name": "VISTA V-Loop Complete v6 (Dynamic Agent Selection)",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "vista-vloop",
+        "responseMode": "responseNode"
+      },
+      "id": "http-trigger",
+      "name": "HTTP Trigger",
+      "type": "n8n-nodes-base.httpTrigger",
+      "typeVersion": 1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "const task = $input.first().json;\\n\\nif (!task.description) {\\n  throw new Error(\\\"Task description is required\\\");\\n}\\n\\nconst vloopTask = {\\n  id: Date.now().toString(),\\n  timestamp: new Date().toISOString(),\\n  description: task.description,\\n  constraints: task.constraints || \\\"\\\",\\n  status: \\\"running\\\"\\n};\\n\\n$workflow.context.data = {\\n  currentTask: vloopTask,\\n  startTime: Date.now(),\\n  iteration: 1,\\n  max_iterations: 3,\\n  builderOutputHistory: [],\\n  judgeResultsHistory: []\\n};\\n\\nreturn vloopTask;"
+      },
+      "id": "task-validator",
+      "name": "Task Validator & Initializer",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "authentication": "lmStudioLocal",
+        "url": "http://localhost:1234/v1/chat/completions",
+        "options": { "retryOnFail": true, "retryCount": 3, "retryInterval": 10000 },
+        "method": "POST",
+        "bodyParameters": { "parameters": [ { "name": "model", "value": "={{ $json.builder_model }}" }, { "name": "messages", "value": "={{ $json.builder_prompt }}" } ] }
+      },
+      "id": "builder-agent",
+      "name": "Builder Agent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1120, 300]
+    },
+    { "parameters": { "functionCode": "const builderResponse = $input.first().json;\\nconst builderOutput = builderResponse.choices[0].message.content;\\n\\n$workflow.context.data.builderOutput = builderOutput;\\n$workflow.context.data.builderOutputHistory.push(builderOutput);\\n\\nreturn {\\n  builder_output: builderOutput\\n};" }, "id": "process-builder", "name": "Process Builder Output", "type": "n8n-nodes-base.function", "typeVersion": 1, "position": [1340, 300] },
+    { "parameters": { "authentication": "lmStudioLocal", "url": "http://localhost:1234/v1/chat/completions", "options": { "retryOnFail": true, "retryCount": 3, "retryInterval": 10000 }, "method": "POST", "bodyParameters": { "parameters": [ { "name": "model", "value": "={{ $json.probing_judge_model }}" }, { "name": "messages", "value": "={{ $json.probing_judge_prompt }}" } ] } }, "id": "probing-judge", "name": "Probing Judge", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.1, "position": [1780, 180] },
+    { "parameters": { "authentication": "lmStudioLocal", "url": "http://localhost:1234/v1/chat/completions", "options": { "retryOnFail": true, "retryCount": 3, "retryInterval": 10000 }, "method": "POST", "bodyParameters": { "parameters": [ { "name": "model", "value": "={{ $json.adversarial_judge_model }}" }, { "name": "messages", "value": "={{ $json.adversarial_judge_prompt }}" } ] } }, "id": "adversarial-judge", "name": "Adversarial Judge", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.1, "position": [1780, 300] },
+    { "parameters": { "authentication": "lmStudioLocal", "url": "http://localhost:1234/v1/chat/completions", "options": { "retryOnFail": true, "retryCount": 3, "retryInterval": 10000 }, "method": "POST", "bodyParameters": { "parameters": [ { "name": "model", "value": "={{ $json.meta_judge_model }}" }, { "name": "messages", "value": "={{ $json.meta_judge_prompt }}" } ] } }, "id": "meta-judge", "name": "Meta Judge", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.1, "position": [1780, 420] },
+    { "parameters": { "functionCode": "const probing = $input.all()[0].json;\\nconst adversarial = $input.all()[1].json;\\nconst meta = $input.all()[2].json;\\n\\nconst judgeResults = {\\n  probing: probing.choices[0].message.content,\\n  adversarial: adversarial.choices[0].message.content,\\n  meta: meta.choices[0].message.content\\n};\\n\\n$workflow.context.data.judgeResults = judgeResults;\\n$workflow.context.data.judgeResultsHistory.push(judgeResults);\\n\\nconst hasCriticalDefects = judgeResults.adversarial.toLowerCase().includes('critical');\\n\\nreturn {\\n  ...judgeResults,\\n  requires_remediation: hasCriticalDefects\\n};" }, "id": "synthesize-judges", "name": "Synthesize Judge Results", "type": "n8n-nodes-base.function", "typeVersion": 1, "position": [2000, 300] },
+    { "parameters": { "conditions": { "conditions": [ { "id": "remediation-condition", "leftValue": "={{ $json.requires_remediation }}", "rightValue": true }, { "id": "iteration-condition", "leftValue": "={{ $workflow.context.data.iteration }}", "rightValue": "={{ $workflow.context.data.max_iterations }}", "operator": { "type": "number", "operation": "smaller" } } ] } }, "id": "check-remediation", "name": "Check if Remediation Needed", "type": "n8n-nodes-base.if", "typeVersion": 2, "position": [2220, 300] },
+    { "parameters": { "functionCode": "const executionTime = Date.now() - $workflow.context.data.startTime;\\n\\nconst finalResponse = {\\n  success: !$json.requires_remediation,\\n  task_id: $workflow.context.data.currentTask.id,\\n  execution_time: executionTime,\\n  iterations: $workflow.context.data.iteration,\\n  results: {\\n    builderHistory: $workflow.context.data.builderOutputHistory,\\n    judgeHistory: $workflow.context.data.judgeResultsHistory\\n  }\\n};\\n\\nreturn finalResponse;" }, "id": "prepare-response", "name": "Prepare Final Response", "type": "n8n-nodes-base.function", "typeVersion": 1, "position": [2440, 300] },
+    { "parameters": {}, "id": "merge-for-loop", "name": "Merge For Loop", "type": "n8n-nodes-base.merge", "typeVersion": 2, "position": [680, 300] },
+    { "parameters": { "functionCode": "$workflow.context.data.iteration += 1;\\nreturn $input.first();" }, "id": "update-iteration-counter", "name": "Update Iteration Counter", "type": "n8n-nodes-base.function", "typeVersion": 1, "position": [2110, 420] },
+    { "parameters": { "functionCode": "const knowledge = $workflow.context.data.knowledge || [];\\nlet knowledgeContext = 'No prior knowledge found.';\\nif (knowledge.length > 0) {\\n  knowledgeContext = 'Prior Knowledge:\\n' + knowledge.map(k => `- ${k.task}: ${k.solution.substring(0, 100)}...`).join('\\n');\\n}\\n\\nif ($workflow.context.data.iteration > 1) {\\n  const lastBuilderOutput = $workflow.context.data.builderOutput;\\n  const judgeFeedback = $workflow.context.data.judgeResults;\\n  return { \\n    builder_prompt: [{ role: 'system', content: 'You are a remediation expert...' }, { role: 'user', content: `Original Task: ${$workflow.context.data.currentTask.description}\\n\\n${knowledgeContext}\\n\\nPrevious Attempt (Code):\\n${lastBuilderOutput}\\n\\nCRITICAL FEEDBACK:\\n- Probing Judge: ${judgeFeedback.probing}\\n- Adversarial Judge: ${judgeFeedback.adversarial}\\n\\nPlease generate a new version of the code that addresses all the feedback.` }]\\n  };\\n} else {\\n  return { \\n    builder_prompt: [{ role: 'system', content: 'You are an expert software engineer...' }, { role: 'user', content: `Task: ${$json.description}\\n\\nConstraints: ${$json.constraints}\\n\\n${knowledgeContext}\\n\\nGenerate implementation:` }]\\n  };\\n}" }, "id": "prepare-builder-prompt", "name": "Prepare Builder Prompt", "type": "n8n-nodes-base.function", "typeVersion": 1, "position": [900, 300] },
+    { "parameters": { "functionCode": "const fs = require('fs');\\nconst filePath = './knowledge_base.json';\\nlet knowledge = [];\\ntry {\\n  if (fs.existsSync(filePath)) {\\n    knowledge = JSON.parse(fs.readFileSync(filePath, 'utf8'));\\n  }\\n} catch (error) {\\n  // File might be empty or corrupt, start with empty knowledge\\n}\\n$workflow.context.data.knowledge = knowledge;\\nreturn $input.first();" }, "id": "read-knowledge-base", "name": "Read Knowledge Base", "type": "n8n-nodes-base.function", "typeVersion": 1, "position": [570, 420] },
+    { "parameters": { "functionCode": "const fs = require('fs');\\nconst filePath = './knowledge_base.json';\\nconst newKnowledge = {\\n  task: $workflow.context.data.currentTask.description,\\n  solution: $workflow.context.data.builderOutput,\\n  judges: $workflow.context.data.judgeResults,\\n  timestamp: new Date().toISOString()\\n};\\n\\nconst knowledge = $workflow.context.data.knowledge || [];\\nknowledge.push(newKnowledge);\\nfs.writeFileSync(filePath, JSON.stringify(knowledge, null, 2));\\nreturn $input.first();" }, "id": "write-knowledge-base", "name": "Write Knowledge Base", "type": "n8n-nodes-base.function", "typeVersion": 1, "position": [2660, 300] },
+    { "parameters": { "functionCode": "const taskDescription = $input.first().json.description.toLowerCase();\\nlet builderModel = 'codellama-7b-instruct.q4_K_M';\\nlet judgeModel = 'mistral-7b-instruct-v0.2.q4_K_M';\\n\\nif (taskDescription.includes('ui') || taskDescription.includes('frontend')) {\\n  builderModel = 'vicuna-7b-v1.5.q4_K_M';\\n} else if (taskDescription.includes('security') || taskDescription.includes('database')) {\\n    builderModel = 'llama-2-7b-chat.q4_K_M';\\n}\\n\\nreturn {\\n  builder_model: builderModel,\\n  probing_judge_model: judgeModel,\\n  adversarial_judge_model: 'llama-2-7b-chat.q4_K_M',\\n  meta_judge_model: 'vicuna-7b-v1.5.q4_K_M'\\n};" }, "id": "scheduler", "name": "Scheduler", "type": "n8n-nodes-base.function", "typeVersion": 1, "position": [680, 540] }
+  ],
+  "connections": {
+    "http-trigger": { "main": [ [ { "node": "task-validator", "type": "main", "index": 0 } ] ] },
+    "task-validator": { "main": [ [ { "node": "read-knowledge-base", "type": "main", "index": 0 } ] ] },
+    "builder-agent": { "main": [ [ { "node": "process-builder", "type": "main", "index": 0 } ] ] },
+    "process-builder": { "main": [ [ { "node": "prepare-judge-prompts", "type": "main", "index": 0 } ] ] },
+    "probing-judge": { "main": [ [ { "node": "synthesize-judges", "type": "main", "index": 0 } ] ] },
+    "adversarial-judge": { "main": [ [ { "node": "synthesize-judges", "type": "main", "index": 0 } ] ] },
+    "meta-judge": { "main": [ [ { "node": "synthesize-judges", "type": "main", "index": 0 } ] ] },
+    "synthesize-judges": { "main": [ [ { "node": "update-iteration-counter", "type": "main", "index": 0 } ] ] },
+    "check-remediation": { "main": [ [ { "node": "prepare-response", "type": "main", "index": 0 } ], [ { "node": "merge-for-loop", "type": "main", "index": 1 } ] ] },
+    "prepare-response": { "main": [ [ { "node": "write-knowledge-base", "type": "main", "index": 0 } ] ] },
+    "merge-for-loop": { "main": [ [ { "node": "prepare-builder-prompt", "type": "main", "index": 0 } ] ] },
+    "update-iteration-counter": { "main": [ [ { "node": "check-remediation", "type": "main", "index": 0 } ] ] },
+    "read-knowledge-base": { "main": [ [ { "node": "scheduler", "type": "main", "index": 0 } ] ] },
+    "write-knowledge-base": { "main": [ [ { "node": "http-response", "type": "main", "index": 0 } ] ] },
+    "scheduler": { "main": [ [ { "node": "merge-for-loop", "type": "main", "index": 0 } ] ] }
+  }
+}

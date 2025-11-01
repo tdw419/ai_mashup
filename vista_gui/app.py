@@ -34,15 +34,13 @@ def run_vista_vloop(task_id, goal):
 
         # Initialize components
         db = LanceHistoryStore(uri="../.lancedb")
-        llm = lambda p: f"LLM response for: {p[:100]}..."
+
+        from engine.llm import litellm_completion
+        llm = litellm_completion
 
         workflow = BuilderFirstWorkflow(llm, db, cfg)
 
         log("Workflow initialized. Running task...")
-        # Simulate a long-running process
-        for i in range(5):
-            log(f"Processing step {i+1}...")
-            time.sleep(1)
 
         final_result, report = workflow.run(goal)
 

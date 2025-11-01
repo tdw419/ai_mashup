@@ -1,0 +1,248 @@
+{
+  "name": "VISTA V-Loop Complete v2 (Recursive)",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "vista-vloop",
+        "responseMode": "responseNode"
+      },
+      "id": "http-trigger",
+      "name": "HTTP Trigger",
+      "type": "n8n-nodes-base.httpTrigger",
+      "typeVersion": 1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "const task = $input.first().json;\\n\\nif (!task.description) {\\n  throw new Error(\\\"Task description is required\\\");\\n}\\n\\nconst vloopTask = {\\n  id: Date.now().toString(),\\n  timestamp: new Date().toISOString(),\\n  description: task.description,\\n  constraints: task.constraints || \\\"\\\",\\n  status: \\\"running\\\"\\n};\\n\\n// Initialize workflow context for looping\\n$workflow.context.data = {\\n  currentTask: vloopTask,\\n  startTime: Date.now(),\\n  iteration: 1,\\n  max_iterations: 3,\\n  builderOutputHistory: [],\\n  judgeResultsHistory: []\\n};\\n\\nreturn vloopTask;"
+      },
+      "id": "task-validator",
+      "name": "Task Validator & Initializer",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "authentication": "lmStudioLocal",
+        "url": "http://localhost:1234/v1/chat/completions",
+        "options": {},
+        "method": "POST",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "model",
+              "value": "codellama-7b-instruct.q4_K_M"
+            },
+            {
+              "name": "messages",
+              "value": "={{[{ role: 'system', content: 'You are an expert software engineer...' }, { role: 'user', content: $json.prompt || `Task: ${$json.description}\\n\\nConstraints: ${$json.constraints}\\n\\nGenerate implementation:` }]}}"
+            }
+          ]
+        },
+        "sendHeaders": true
+      },
+      "id": "builder-agent",
+      "name": "Builder Agent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "const builderResponse = $input.first().json;\\nconst builderOutput = builderResponse.choices[0].message.content;\\n\\n$workflow.context.data.builderOutput = builderOutput;\\n$workflow.context.data.currentTask.builder_result = builderOutput;\\n$workflow.context.data.builderOutputHistory.push(builderOutput);\\n\\nreturn {\\n  builder_output: builderOutput\\n};"
+      },
+      "id": "process-builder",
+      "name": "Process Builder Output",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "authentication": "lmStudioLocal",
+        "url": "http://localhost:1234/v1/chat/completions",
+        "options": {},
+        "method": "POST",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "model",
+              "value": "mistral-7b-instruct-v0.2.q4_K_M"
+            },
+            {
+              "name": "messages",
+              "value": "={{[{ role: 'system', content: 'You are a probing judge...' }, { role: 'user', content: `Builder Output:\\n${$json.builder_output}` }]}}"
+            }
+          ]
+        }
+      },
+      "id": "probing-judge",
+      "name": "Probing Judge",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1340, 180]
+    },
+    {
+      "parameters": {
+        "authentication": "lmStudioLocal",
+        "url": "http://localhost:1234/v1/chat/completions",
+        "options": {},
+        "method": "POST",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "model",
+              "value": "llama-2-7b-chat.q4_K_M"
+            },
+            {
+              "name": "messages",
+              "value": "={{[{ role: 'system', content: 'You are an adversarial judge...' }, { role: 'user', content: `Builder Output:\\n${$json.builder_output}` }]}}"
+            }
+          ]
+        }
+      },
+      "id": "adversarial-judge",
+      "name": "Adversarial Judge",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1340, 300]
+    },
+    {
+      "parameters": {
+        "authentication": "lmStudioLocal",
+        "url": "http://localhost:1234/v1/chat/completions",
+        "options": {},
+        "method": "POST",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "model",
+              "value": "vicuna-7b-v1.5.q4_K_M"
+            },
+            {
+              "name": "messages",
+              "value": "={{[{ role: 'system', content: 'You are a meta judge...' }, { role: 'user', content: `Builder Output:\\n${$json.builder_output}` }]}}"
+            }
+          ]
+        }
+      },
+      "id": "meta-judge",
+      "name": "Meta Judge",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1340, 420]
+    },
+    {
+      "parameters": {
+        "functionCode": "const probing = $input.all()[0].json;\\nconst adversarial = $input.all()[1].json;\\nconst meta = $input.all()[2].json;\\n\\nconst judgeResults = {\\n  probing: probing.choices[0].message.content,\\n  adversarial: adversarial.choices[0].message.content,\\n  meta: meta.choices[0].message.content\\n};\\n\\n$workflow.context.data.judgeResults = judgeResults;\\n$workflow.context.data.judgeResultsHistory.push(judgeResults);\\n\\nconst hasCriticalDefects = judgeResults.adversarial.toLowerCase().includes('critical');\\n\\nreturn {\\n  ...judgeResults,\\n  requires_remediation: hasCriticalDefects\\n};"
+      },
+      "id": "synthesize-judges",
+      "name": "Synthesize Judge Results",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1560, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "remediation-condition",
+              "leftValue": "={{ $json.requires_remediation }}",
+              "rightValue": true
+            },
+            {
+              "id": "iteration-condition",
+              "leftValue": "={{ $workflow.context.data.iteration }}",
+              "rightValue": "={{ $workflow.context.data.max_iterations }}",
+              "operator": {
+                "type": "number",
+                "operation": "smaller"
+              }
+            }
+          ]
+        }
+      },
+      "id": "check-remediation",
+      "name": "Check if Remediation Needed",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1780, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "const remediation = $input.first().json;\\nconst fixedCode = remediation.choices[0].message.content;\\n\\n$workflow.context.data.remediation = fixedCode;\\n\\nreturn {\\n  prompt: `Task: ${$workflow.context.data.currentTask.description}\\n\\nConstraints: ${$workflow.context.data.currentTask.constraints}\\n\\nPrevious Attempt:\\n${$workflow.context.data.builderOutput}\\n\\nIssues Found:\\n${$workflow.context.data.judgeResults.adversarial}\\n\\nCorrected Code:\\n${fixedCode}\\n\\nPlease re-evaluate the corrected code.`\\n};"
+      },
+      "id": "process-remediation",
+      "name": "Process Remediation",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [2000, 180]
+    },
+    {
+      "parameters": {
+        "functionCode": "const executionTime = Date.now() - $workflow.context.data.startTime;\\n\\nconst finalResponse = {\\n  success: !$json.requires_remediation,\\n  task_id: $workflow.context.data.currentTask.id,\\n  execution_time: executionTime,\\n  iterations: $workflow.context.data.iteration,\\n  results: {\\n    builderHistory: $workflow.context.data.builderOutputHistory,\\n    judgeHistory: $workflow.context.data.judgeResultsHistory\\n  }\\n};\\n\\nreturn finalResponse;"
+      },
+      "id": "prepare-response",
+      "name": "Prepare Final Response",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [2220, 300]
+    },
+    {
+      "parameters": {
+        "responseMode": "lastNode"
+      },
+      "id": "http-response",
+      "name": "HTTP Response",
+      "type": "n8n-nodes-base.httpResponse",
+      "typeVersion": 1,
+      "position": [2440, 300]
+    },
+    {
+      "parameters": {},
+      "id": "merge-for-loop",
+      "name": "Merge For Loop",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "$workflow.context.data.iteration += 1;\\nreturn $input.first();"
+      },
+      "id": "update-iteration-counter",
+      "name": "Update Iteration Counter",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1670, 420]
+    },
+    {
+      "parameters": {
+        "functionCode": "const lastBuilderOutput = $workflow.context.data.builderOutput;\\nconst judgeFeedback = $workflow.context.data.judgeResults;\\n\\nconst remediationPrompt = `Original Task: ${$workflow.context.data.currentTask.description}\\n\\nPrevious Attempt (Code):\\n${lastBuilderOutput}\\n\\nCRITICAL FEEDBACK:\\n- Probing Judge: ${judgeFeedback.probing}\\n- Adversarial Judge: ${judgeFeedback.adversarial}\\n\\nPlease generate a new version of the code that addresses all the feedback.`;\\n\\nreturn { prompt: remediationPrompt };"
+      },
+      "id": "prepare-remediation-prompt",
+      "name": "Prepare Remediation Prompt",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1890, 80]
+    }
+  ],
+  "connections": {
+    "http-trigger": { "main": [ [ { "node": "task-validator", "type": "main", "index": 0 } ] ] },
+    "task-validator": { "main": [ [ { "node": "merge-for-loop", "type": "main", "index": 0 } ] ] },
+    "builder-agent": { "main": [ [ { "node": "process-builder", "type": "main", "index": 0 } ] ] },
+    "process-builder": { "main": [ [ { "node": "probing-judge", "type": "main", "index": 0 } ], [ { "node": "adversarial-judge", "type": "main", "index": 0 } ], [ { "node": "meta-judge", "type": "main", "index": 0 } ] ] },
+    "probing-judge": { "main": [ [ { "node": "synthesize-judges", "type": "main", "index": 0 } ] ] },
+    "adversarial-judge": { "main": [ [ { "node": "synthesize-judges", "type": "main", "index": 0 } ] ] },
+    "meta-judge": { "main": [ [ { "node": "synthesize-judges", "type": "main", "index": 0 } ] ] },
+    "synthesize-judges": { "main": [ [ { "node": "update-iteration-counter", "type": "main", "index": 0 } ] ] },
+    "check-remediation": { "main": [ [ { "node": "prepare-response", "type": "main", "index": 0 } ], [ { "node": "prepare-remediation-prompt", "type": "main", "index": 0 } ] ] },
+    "process-remediation": { "main": [ [ { "node": "merge-for-loop", "type": "main", "index": 1 } ] ] },
+    "prepare-response": { "main": [ [ { "node": "http-response", "type": "main", "index": 0 } ] ] },
+    "merge-for-loop": { "main": [ [ { "node": "builder-agent", "type": "main", "index": 0 } ] ] },
+    "update-iteration-counter": { "main": [ [ { "node": "check-remediation", "type": "main", "index": 0 } ] ] },
+    "prepare-remediation-prompt": { "main": [ [ { "node": "builder-agent", "type": "main", "index": 0 } ] ] }
+  }
+}
