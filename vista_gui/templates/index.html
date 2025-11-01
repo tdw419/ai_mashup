@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VISTA V-Loop</title>
+    <style>
+        body { font-family: sans-serif; }
+        .container { max-width: 800px; margin: 0 auto; padding: 20px; }
+        #logs { white-space: pre-wrap; background-color: #f4f4f4; padding: 10px; border-radius: 5px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>VISTA V-Loop</h1>
+        <form id="task-form">
+            <label for="goal">Goal:</label><br>
+            <input type="text" id="goal" name="goal" style="width: 100%;"><br><br>
+            <button type="submit">Start Task</button>
+        </form>
+        <h2>Logs</h2>
+        <div id="logs"></div>
+        <h2>Knowledge Evolution</h2>
+        <div id="qa-metrics"></div>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <script>
+        const form = document.getElementById('task-form');
+        const logsDiv = document.getElementById('logs');
+        let taskId = null;
+
+        const socket = io();
+
+        socket.on('log', function(data) {
+            if (data.task_id === taskId) {
+                logsDiv.textContent += data.log + '\n';
+            }
+        });
+
+        socket.on('task_completed', function(data) {
+            if (data.task_id === taskId) {
+                logsDiv.textContent += '\n--- TASK COMPLETED ---\n';
+                const report = data.report;
+                logsDiv.textContent += JSON.stringify(report, null, 2);
+
+                const qaMetrics = report.qa_metrics;
+                const metricsDiv = document.getElementById('qa-metrics');
+                metricsDiv.innerHTML = `
+                    <p>Phase: ${qaMetrics.phase}</p>
+                    <p>Questions: ${qaMetrics.created_questions}</p>
+                    <p>Answers: ${qaMetrics.created_answers}</p>
+                    <canvas id="qa-chart"></canvas>
+                `;
+
+                const ctx = document.getElementById('qa-chart').getContext('2d');
+                new Chart(ctx, {
+                    type: 'bar',
+                    data: {
+                        labels: ['Questions', 'Answers'],
+                        datasets: [{
+                            label: 'Count',
+                            data: [qaMetrics.created_questions, qaMetrics.created_answers],
+                            backgroundColor: [
+                                'rgba(255, 99, 132, 0.2)',
+                                'rgba(54, 162, 235, 0.2)'
+                            ],
+                            borderColor: [
+                                'rgba(255, 99, 132, 1)',
+                                'rgba(54, 162, 235, 1)'
+                            ],
+                            borderWidth: 1
+                        }]
+                    },
+                    options: {
+                        scales: {
+                            y: {
+                                beginAtZero: true
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        socket.on('task_failed', function(data) {
+            if (data.task_id === taskId) {
+                logsDiv.textContent += `\n--- TASK FAILED ---\nError: ${data.error}`;
+            }
+        });
+
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const goal = document.getElementById('goal').value;
+
+            logsDiv.textContent = 'Starting task...';
+
+            const response = await fetch('/vloop/run', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ goal }),
+            });
+
+            const data = await response.json();
+            taskId = data.task_id;
+            logsDiv.textContent = ''; // Clear "Starting task..." message
+        });
+    </script>
+</body>
+</html>

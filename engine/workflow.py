@@ -4,6 +4,7 @@ from engine.knowledge.qa_engine import QASprint, QAGates
 from engine.knowledge.store import MemoryStore
 from engine.knowledge.phase_policy import PhasePolicy
 import json
+from typing import Dict, Any
 
 class BuilderFirstWorkflow:
     def __init__(self, llm, vecdb, cfg):
