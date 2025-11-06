@@ -1,0 +1,3 @@
+  File "/app/ai_mash.py", line 517
+    f"Analyze the following documents and schema:\n\n<SCHEMA>\n{schema_str}\n</SCHEMA>\n\n"
+IndentationError: unexpected indent

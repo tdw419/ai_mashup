@@ -27,17 +27,20 @@ import pathlib
 import textwrap
 import zipfile
 import shlex
+import sqlite3
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 try:
     import requests
     import pyperclip
+    import lancedb
 except ImportError:
-    raise SystemExit("Missing deps. Please run: pip install requests pyperclip")
+    raise SystemExit("Missing deps. Please run: pip install -r requirements.txt")
 
 # --- Globals and Configuration ---
 ROOT = pathlib.Path(__file__).parent.resolve()
 MASH_DIR = ROOT / "mash_runs"
+DB_DIR = ROOT / "lancedb_data"
 CONFIG_FILE = ROOT / "ai_mash_config.json"
 # Global toggle (set by CLI flags) to skip reducer per run
 NO_REDUCER = False
@@ -403,6 +406,143 @@ def cmd_loop(args):
         prompt = "Please review the context and provide the next logical step, refinement, or implementation."
     print(f"\nLoop complete → {session_dir / f'round_{args.rounds:02d}' / 'mash_merged.md'}")
 
+
+def execute_db_actions(db, actions):
+    """Execute a list of database actions suggested by the LLM."""
+    for action in actions:
+        op = action.get("operation")
+        try:
+            if op == "rename_table":
+                db.rename_table(action["from"], action["to"])
+                print(f"Renamed table {action['from']} to {action['to']}")
+            elif op == "drop_table":
+                db.drop_table(action["table_name"])
+                print(f"Dropped table {action['table_name']}")
+            elif op == "create_table":
+                # This is a simplified version. A real implementation would need to handle schema definitions.
+                db.create_table(action["table_name"], data=[])
+                print(f"Created table {action['table_name']}")
+            elif op == "move_data":
+                # This is a placeholder for a more complex data migration logic.
+                print(f"Moving data from {action['from']} to {action['to']} (not implemented).")
+            else:
+                print(f"Unknown operation: {op}")
+        except Exception as e:
+            print(f"Error executing action {op}: {e}")
+
+def init_organizer_db():
+    """Initializes the SQLite DB for storing organization plans."""
+    con = sqlite3.connect("mash_organizer.sqlite")
+    cur = con.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS organization_plans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            llm_plan_json TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'proposed' -- proposed, executed, failed
+        )
+    """)
+    con.commit()
+    con.close()
+
+def save_organization_plan(plan_json: str):
+    """Saves a new organization plan from the LLM to the database."""
+    init_organizer_db() # Ensure DB and table exist
+    con = sqlite3.connect("mash_organizer.sqlite")
+    cur = con.cursor()
+    cur.execute(
+        "INSERT INTO organization_plans (created_at, llm_plan_json) VALUES (?, ?)",
+        (now_iso(), plan_json)
+    )
+    con.commit()
+    con.close()
+
+def cmd_database(args):
+    """Manage the LanceDB database."""
+    action = args.action
+    db = lancedb.connect(DB_DIR)
+
+    if action == "create":
+        print(f"LanceDB database created at {DB_DIR}")
+        if "documents" not in db.table_names():
+            import pyarrow as pa
+            schema = pa.schema([
+                pa.field("vector", pa.list_(pa.float32(), 2)),
+                pa.field("text", pa.string()),
+                pa.field("id", pa.string())
+            ])
+            db.create_table("documents", schema=schema, data=[
+                {'vector': [1.1, 1.2], 'text': 'hello world', 'id': '1'},
+                {'vector': [0.5, 1.5], 'text': 'foo bar', 'id': '2'}
+            ])
+            print("Created dummy 'documents' table for demonstration.")
+
+    elif action == "organize":
+        print("Database organization loop started...")
+        table_names = db.table_names()
+        if not table_names:
+            raise SystemExit("No tables found in the database to organize.")
+
+        reducer_agent = CONFIG.get("reducer")
+        if not (reducer_agent and reducer_agent.get("enabled")):
+            raise SystemExit("Reducer agent is required for organization but is disabled.")
+
+        for i in range(5):  # Limit iterations to prevent infinite loops
+            print(f"\n--- Organization Iteration {i+1} ---")
+            current_schema = {name: str(db.open_table(name).schema) for name in db.table_names()}
+            schema_str = json.dumps(current_schema, indent=2)
+
+            con = sqlite3.connect("mash_organizer.sqlite")
+            cur = con.cursor()
+            res = cur.execute("SELECT llm_plan_json FROM organization_plans ORDER BY id DESC LIMIT 1")
+            last_plan = res.fetchone()
+            con.close()
+
+            previous_plan_prompt = ""
+            if last_plan:
+                previous_plan_prompt = f"The previous plan was:\n<PREVIOUS_PLAN>\n{last_plan[0]}\n</PREVIOUS_PLAN>\n\nCritique this plan and improve it. If no improvements are needed, respond with `{{\"status\": \"DONE\"}}`."
+
+            prompt = (
+                "You are a database architect iteratively refining a LanceDB organization. "
+                f"Current schema:\n<SCHEMA>\n{schema_str}\n</SCHEMA>\n\n"
+                f"{previous_plan_prompt}"
+                "Propose a new organization scheme by extracting entities and relationships. "
+                "Your output must be a JSON object with two keys: "
+                "1. `plan`: A human-readable explanation of your proposed changes. "
+                "2. `actions`: A list of actions to execute. Valid actions are: "
+                "   - `{'operation': 'create_entity_table', 'table_name': '...', 'schema': {...}}` "
+                "   - `{'operation': 'extract_and_move_data', 'source_table': '...', 'target_table': '...', 'entity_type': '...'}`"
+                "\nIf the current organization is satisfactory, respond with `{\"status\": \"DONE\"}`."
+            )
+            messages = [{"role": "system", "content": reducer_agent.get("system", "")},
+                        {"role": "user", "content": prompt}]
+            response_str = openai_chat(reducer_agent, messages)
+            print(f"LLM suggestion: {response_str}")
+
+            try:
+                response_json = json.loads(response_str)
+                if response_json.get("status") == "DONE":
+                    print("LLM is satisfied. Organization complete.")
+                    break
+
+                plan = response_json.get("plan")
+                if plan:
+                    print(f"LLM Plan: {plan}")
+
+                actions = response_json.get("actions")
+                if actions:
+                    save_organization_plan(response_str)
+                    print("LLM organization plan has been saved. Executing actions...")
+                    execute_db_actions(db, actions)
+                else:
+                    print("No actions provided by LLM.")
+
+            except json.JSONDecodeError:
+                print("Invalid JSON from LLM. Aborting.")
+                break
+    else:
+        raise SystemExit(f"Unknown database action: {action}")
+
 def generate_index_html():
     """Create a sidebar viewer at mash_runs/index.html showing mash + structured reducer JSON."""
     ensure_dir(MASH_DIR)
@@ -432,6 +572,11 @@ def generate_index_html():
   summary{font-weight:700;cursor:pointer}
   ul{margin:8px 0 0;padding-left:20px}
   .muted{color:#666}
+  .tabs{display:flex;border-bottom:1px solid var(--border);margin-bottom:16px}
+  .tab-button{background:none;border:none;padding:10px 15px;cursor:pointer;font-size:16px}
+  .tab-button.active{border-bottom:2px solid blue}
+  .tab-content{display:none}
+  .tab-content.active{display:block}
 </style>
 </head>
 <body>
@@ -445,12 +590,25 @@ def generate_index_html():
     <div id="structured-summary"></div>
   </div>
   <div class="main">
-    <h2>Mash Content</h2>
-    <div id="content" class="muted">Select a session and round, then click Load.</div>
+    <div class="tabs">
+      <button class="tab-button active" data-tab="mash">Mash Content</button>
+      <button class="tab-button" data-tab="db">Database</button>
+    </div>
+    <div id="mash-content" class="tab-content active">
+      <h2>Mash Content</h2>
+      <div id="content" class="muted">Select a session and round, then click Load.</div>
+    </div>
+    <div id="db-content" class="tab-content">
+      <h2>Database</h2>
+      <p>Database Path: <code id="db-path"></code></p>
+      <button id="organize-db">Organize Database</button>
+      <div id="db-tables"></div>
+    </div>
   </div>
 <script>
 const sessions = %SESSIONS%;
 const REDUCER_NAME = %REDUCER_NAME%;
+const DB_PATH = %DB_PATH%;
 const sessionSel = document.getElementById('session');
 const roundSel = document.getElementById('round');
 const contentEl = document.getElementById('content');
@@ -545,6 +703,51 @@ function escapeHtml(s) {
 document.addEventListener('DOMContentLoaded', () => {
   populateSessions();
   loadBtn.addEventListener('click', loadMash);
+
+  document.getElementById('db-path').textContent = DB_PATH;
+
+  document.querySelectorAll('.tab-button').forEach(button => {
+    button.addEventListener('click', () => {
+      document.querySelectorAll('.tab-button').forEach(btn => btn.classList.remove('active'));
+      button.classList.add('active');
+      document.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
+      document.getElementById(button.dataset.tab + '-content').classList.add('active');
+    });
+  });
+
+  const organizeBtn = document.getElementById('organize-db');
+  const dbTablesDiv = document.getElementById('db-tables');
+
+  organizeBtn.addEventListener('click', async () => {
+      organizeBtn.textContent = 'Starting...';
+      organizeBtn.disabled = true;
+      await fetch('/api/organization/start', { method: 'POST' });
+      organizeBtn.textContent = 'Organize Database';
+      organizeBtn.disabled = false;
+  });
+
+  // Poll for status updates every 5 seconds
+  setInterval(async () => {
+      const response = await fetch('/api/organization/status');
+      const plans = await response.json();
+
+      dbTablesDiv.innerHTML = '<h3>Latest Organization Plans:</h3>';
+      if (plans.length === 0) {
+          dbTablesDiv.innerHTML += '<p>No organization plans yet.</p>';
+      } else {
+          plans.forEach(plan => {
+              const planDiv = document.createElement('div');
+              planDiv.style.border = '1px solid #ccc';
+              planDiv.style.padding = '10px';
+              planDiv.style.marginBottom = '10px';
+              planDiv.innerHTML = `
+                  <p><b>Time:</b> ${new Date(plan.time).toLocaleString()} | <b>Status:</b> ${plan.status}</p>
+                  <pre><code>${JSON.stringify(JSON.parse(plan.plan), null, 2)}</code></pre>
+              `;
+              dbTablesDiv.appendChild(planDiv);
+          });
+      }
+  }, 5000);
 });
 </script>
 </body>
@@ -552,6 +755,7 @@ document.addEventListener('DOMContentLoaded', () => {
 """
     html = html.replace("%SESSIONS%", json.dumps(data))
     html = html.replace("%REDUCER_NAME%", json.dumps(reducer_name))
+    html = html.replace("%DB_PATH%", json.dumps(str(DB_DIR.resolve())))
     write_text(MASH_DIR / "index.html", html)
 
 def cmd_index(_args):
@@ -560,11 +764,42 @@ def cmd_index(_args):
 
 def cmd_serve(args):
     generate_index_html()
-    os.chdir(str(MASH_DIR))
-    from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
+    from flask import Flask, jsonify, request
+    import threading
+
+    app = Flask(__name__, static_folder=str(MASH_DIR), static_url_path='')
+
+    @app.route('/')
+    def index():
+        return app.send_static_file('index.html')
+
+    @app.route('/api/organization/start', methods=['POST'])
+    def start_organization():
+        # Run the lengthy organization task in a background thread
+        def run_org():
+            print("Starting background organization task...")
+            # Using Namespace to simulate the `args` object for the cmd
+            org_args = argparse.Namespace(action="organize")
+            cmd_database(org_args)
+            print("Background organization task finished.")
+
+        thread = threading.Thread(target=run_org)
+        thread.start()
+        return jsonify({"message": "Organization process started."})
+
+    @app.route('/api/organization/status')
+    def organization_status():
+        # Read the latest plan from the SQLite DB to show status
+        con = sqlite3.connect("mash_organizer.sqlite")
+        cur = con.cursor()
+        res = cur.execute("SELECT created_at, llm_plan_json, status FROM organization_plans ORDER BY id DESC LIMIT 5")
+        plans = [{"time": row[0], "plan": row[1], "status": row[2]} for row in res.fetchall()]
+        con.close()
+        return jsonify(plans)
+
     port = args.port
-    print(f"Serving {MASH_DIR} on http://127.0.0.1:{port} (Ctrl+C to stop)")
-    ThreadingHTTPServer(("127.0.0.1", port), SimpleHTTPRequestHandler).serve_forever()
+    print(f"Serving UI on http://127.0.0.1:{port}")
+    app.run(port=port, debug=False)
 
 # --- CLI ---
 def main():
@@ -614,6 +849,9 @@ def main():
     p_serve = sub.add_parser("serve", help="Serve mash_runs/ with a tiny HTTP server.")
     p_serve.add_argument("--port", type=int, default=8888)
     p_serve.set_defaults(func=cmd_serve)
+    p_db = sub.add_parser("db", help="Manage the LanceDB database.")
+    p_db.add_argument("action", choices=["create", "organize"], help="Database action.")
+    p_db.set_defaults(func=cmd_database)
     args = parser.parse_args()
     args.func(args)
 

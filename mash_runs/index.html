@@ -17,6 +17,11 @@
   summary{font-weight:700;cursor:pointer}
   ul{margin:8px 0 0;padding-left:20px}
   .muted{color:#666}
+  .tabs{display:flex;border-bottom:1px solid var(--border);margin-bottom:16px}
+  .tab-button{background:none;border:none;padding:10px 15px;cursor:pointer;font-size:16px}
+  .tab-button.active{border-bottom:2px solid blue}
+  .tab-content{display:none}
+  .tab-content.active{display:block}
 </style>
 </head>
 <body>
@@ -30,12 +35,25 @@
     <div id="structured-summary"></div>
   </div>
   <div class="main">
-    <h2>Mash Content</h2>
-    <div id="content" class="muted">Select a session and round, then click Load.</div>
+    <div class="tabs">
+      <button class="tab-button active" data-tab="mash">Mash Content</button>
+      <button class="tab-button" data-tab="db">Database</button>
+    </div>
+    <div id="mash-content" class="tab-content active">
+      <h2>Mash Content</h2>
+      <div id="content" class="muted">Select a session and round, then click Load.</div>
+    </div>
+    <div id="db-content" class="tab-content">
+      <h2>Database</h2>
+      <p>Database Path: <code id="db-path"></code></p>
+      <button id="organize-db">Organize Database</button>
+      <div id="db-tables"></div>
+    </div>
   </div>
 <script>
 const sessions = [{"name": "session_20250827_150312", "rounds": ["round_01"]}];
 const REDUCER_NAME = "lmstudio-reducer";
+const DB_PATH = "/app/lancedb_data";
 const sessionSel = document.getElementById('session');
 const roundSel = document.getElementById('round');
 const contentEl = document.getElementById('content');
@@ -130,6 +148,17 @@ function escapeHtml(s) {
 document.addEventListener('DOMContentLoaded', () => {
   populateSessions();
   loadBtn.addEventListener('click', loadMash);
+
+  document.getElementById('db-path').textContent = DB_PATH;
+
+  document.querySelectorAll('.tab-button').forEach(button => {
+    button.addEventListener('click', () => {
+      document.querySelectorAll('.tab-button').forEach(btn => btn.classList.remove('active'));
+      button.classList.add('active');
+      document.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
+      document.getElementById(button.dataset.tab + '-content').classList.add('active');
+    });
+  });
 });
 </script>
 </body>
