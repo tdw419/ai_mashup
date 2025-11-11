@@ -29,11 +29,16 @@ import zipfile
 import shlex
 from datetime import datetime
 from typing import Dict, Any, List, Optional
+import uuid
+from db_operations import get_db_connection, save_to_db
+from db_explorer import DatabaseExplorer
+from curator import LanceDBCurator
+
 try:
     import requests
     import pyperclip
 except ImportError:
-    raise SystemExit("Missing deps. Please run: pip install requests pyperclip")
+    raise SystemExit("Missing deps. Please run: pip install -r requirements.txt")
 
 # --- Globals and Configuration ---
 ROOT = pathlib.Path(__file__).parent.resolve()
@@ -105,6 +110,12 @@ def clamp_context(txt: str) -> str:
         return txt
     return txt[:limit] + "\n...[context truncated]..."
 
+def detect_pxos_primitives(text: str):
+    """Detects pxOS primitives in text and returns a boolean flag and a list of hits."""
+    primitives = ["WRITE_BYTE", "ADD_SYMBOL", "COMMENT", "DEFINE", "CALL", "JUMP", "INTERRUPT"]
+    hits = [p for p in primitives if p in text]
+    return bool(hits), hits
+
 # --- Core AI Interaction ---
 def openai_chat(agent: Dict[str, Any], messages: List[Dict[str, str]]) -> str:
     """Send chat to an OpenAI-compatible endpoint (e.g., LM Studio)."""
@@ -149,6 +160,8 @@ def run_round(session_dir: pathlib.Path, round_idx: int, prompt: str, prev_mash:
     round_dir = session_dir / f"round_{round_idx:02d}"
     responses_dir = round_dir / "responses"
     ensure_dir(responses_dir)
+    db = get_db_connection()
+    workflow_id = session_dir.name
     print(f"\n=== Round {round_idx:02d} ===")
     for agent in CONFIG.get("agents", []):
         if agent.get("type") != "openai":
@@ -170,6 +183,22 @@ def run_round(session_dir: pathlib.Path, round_idx: int, prompt: str, prev_mash:
         content = openai_chat(agent, messages)
         out_md = responses_dir / f"{agent['name']}.md"
         write_text(out_md, content)
+        contains_pxos, pxos_keywords = detect_pxos_primitives(content)
+        db_data = {
+            "id": str(uuid.uuid4()),
+            "content": content,
+            "embedding": [0.0] * 1536,  # Placeholder for actual embeddings
+            "stage": f"iteration_{round_idx}_model_{agent['name']}_output",
+            "category": "llm_workflow_management",  # Default category
+            "purpose": "records_llm_output",  # Default purpose
+            "model_used": agent.get("model"),
+            "workflow_id": workflow_id,
+            "iteration": round_idx,
+            "timestamp": now_iso(),
+            "contains_pxos_primitives": contains_pxos,
+            "keywords": pxos_keywords
+        }
+        save_to_db(db, db_data)
         effective_params = CONFIG.get("defaults", {}).copy()
         effective_params.update(agent.get("overrides", {}))
         meta = {
@@ -212,6 +241,22 @@ def run_round(session_dir: pathlib.Path, round_idx: int, prompt: str, prev_mash:
                 print("\nWARNING: Reducer produced invalid JSON. Keeping raw summary intact.\n")
         reducer_out_md = responses_dir / f"_{reducer_agent['name']}_summary.md"
         write_text(reducer_out_md, summary)
+        contains_pxos, pxos_keywords = detect_pxos_primitives(summary)
+        db_data = {
+            "id": str(uuid.uuid4()),
+            "content": summary,
+            "embedding": [0.0] * 1536,  # Placeholder
+            "stage": f"iteration_{round_idx}_reducer_output",
+            "category": "llm_workflow_summary",
+            "purpose": "summarizes_llm_outputs",
+            "model_used": reducer_agent.get("model"),
+            "workflow_id": workflow_id,
+            "iteration": round_idx,
+            "timestamp": now_iso(),
+            "contains_pxos_primitives": contains_pxos,
+            "keywords": pxos_keywords
+        }
+        save_to_db(db, db_data)
         if structured_summary:
             structured_out_path = reducer_out_md.with_name(f"_{reducer_agent['name']}_structured.json")
             write_text(structured_out_path, json.dumps(structured_summary, indent=2))
@@ -558,14 +603,6 @@ def cmd_index(_args):
     generate_index_html()
     print(f"Viewer written → {MASH_DIR / 'index.html'}")
 
-def cmd_serve(args):
-    generate_index_html()
-    os.chdir(str(MASH_DIR))
-    from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
-    port = args.port
-    print(f"Serving {MASH_DIR} on http://127.0.0.1:{port} (Ctrl+C to stop)")
-    ThreadingHTTPServer(("127.0.0.1", port), SimpleHTTPRequestHandler).serve_forever()
-
 # --- CLI ---
 def main():
     parser = argparse.ArgumentParser(
@@ -611,11 +648,31 @@ def main():
     p_issues.set_defaults(func=cmd_issues)
     p_index = sub.add_parser("index", help="Generate mash_runs/index.html viewer.")
     p_index.set_defaults(func=cmd_index)
-    p_serve = sub.add_parser("serve", help="Serve mash_runs/ with a tiny HTTP server.")
-    p_serve.add_argument("--port", type=int, default=8888)
-    p_serve.set_defaults(func=cmd_serve)
+
+    p_db = sub.add_parser("db", help="Database operations.")
+    db_sub = p_db.add_subparsers(dest="db_cmd", required=True)
+    p_db_explore = db_sub.add_parser("explore", help="Launch the Database Explorer.")
+    p_db_explore.set_defaults(func=cmd_db_explore)
+    p_db_curate = db_sub.add_parser("curate", help="Curate a document with an LLM.")
+    p_db_curate.add_argument("doc_id", help="The ID of the document to curate.")
+    p_db_curate.set_defaults(func=cmd_db_curate)
+
     args = parser.parse_args()
     args.func(args)
+
+def cmd_db_explore(args):
+    """Lists recent documents in the database."""
+    explorer = DatabaseExplorer()
+    docs = explorer.list_recent()
+    for doc in docs:
+        print(f"ID: {doc['id']}, Stage: {doc['stage']}, Content: {doc['content'][:100]}...")
+
+def cmd_db_curate(args):
+    """Curate a document with an LLM."""
+    db = get_db_connection()
+    curator = LanceDBCurator(db)
+    result = curator.curate_doc(args.doc_id)
+    print(json.dumps(result, indent=2))
 
 if __name__ == "__main__":
     main()
